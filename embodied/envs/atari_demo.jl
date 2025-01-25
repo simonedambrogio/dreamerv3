@@ -10,6 +10,7 @@ println("Available Atari games:")
 games = list_atari_rom_names()
 println(first(games, 5), "...")
 
+
 # 2. Create environment with specific settings
 # atari: {size: [96, 96], repeat: 4, sticky: True, gray: True, actions: all, lives: unused, noops: 30, autostart: False, pooling: 2, aggregate: max, resize: pillow, clip_reward: False}
 env = AtariEnv(
