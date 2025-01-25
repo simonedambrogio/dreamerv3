@@ -4,6 +4,16 @@ using Statistics, Random
 using ImageTransformations: imresize
 using Interpolations: BSpline, Linear, Lanczos4OpenCV
 
+"""
+Atari environment
+    Example:
+    ```julia
+        using YAML, Tools
+        config = YAML.load_file("dreamerv3/configs.yaml") |> symbolize;
+        include("atari.jl")
+        Atari(; name = "pong", config[:defaults][:env][:atari]...);
+    ```
+"""
 mutable struct Atari
     ale::Ptr{ArcadeLearningEnvironment.ALEInterface}
     repeat::Int64
@@ -31,13 +41,13 @@ end
 function Atari(;
     name::String="pong",
     repeat::Int64=4,
-    size::Tuple{Int64,Int64}=(84, 84),
+    size::Vector{Int64}=[84, 84],
     gray::Bool=true,
     noops::Int64=0,
     lives::Symbol=:unused, # :unused, :discount, :reset
     sticky::Bool=true,
     actions::Symbol=:all, # :all, :needed
-    max_num_frames_per_episode::Int64=108000,
+    max_num_frames_per_episode::Int64=108_000,
     pooling::Int64=2,
     aggregate::Symbol=:max, # :max, :mean
     resize::Symbol=:pillow, # :opencv, :pillow
@@ -49,6 +59,7 @@ function Atari(;
     # reference 1: https://github.com/JuliaReinforcementLearning/ReinforcementLearning.jl/blob/main/src/ReinforcementLearningEnvironments/src/environments/3rd_party/atari.jl
     # reference 2: https://github.com/JuliaReinforcementLearning/ArcadeLearningEnvironment.jl/blob/master/src/aleinterface.jl
 
+    size = Tuple(size)
     # Initialize ALE
     ale = ALE_new() # reference 2
     setLoggerMode!(log_level) # reference 2
@@ -151,7 +162,7 @@ function step!(env::Atari, action::Dict)
             is_last = true
         end
 
-        if env.duration >= env.length
+        if env.duration >= env.max_num_frames_per_episode
             is_last = true
         end
         
