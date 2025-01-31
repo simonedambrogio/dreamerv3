@@ -1,84 +1,148 @@
 using Lux, NNlib, Random, Tools
-include("RMSNorm.jl")
-function encoder(rng=Random.default_rng(); 
-    obs_space::Dict,
-    units::Int=1024,
-    depth::Int=64,
+include("../embodied/lux/RMSNorm.jl")
+
+
+struct Encoder
+    act::Function
+    mults::Tuple
+    depth::Int
+    kernel::Int
+    net::Chain
+end
+
+
+function Encoder(;
+    obs::Space,
+    act::Function=gelu,
     mults::Tuple=(2, 3, 4, 4),
-    layers::Int=3,
-    kernel::Int=5,
-    symlog::Bool=true,
-    outer::Bool=false,
-    strided::Bool=false)
-    
-    # Determine input type based on dimentionality
-    veckeys = Symbol[k for (k,v) in obs_space if length(v.size) ≤ 2];
-    imgkeys = Symbol[k for (k,v) in obs_space if length(v.size) == 3];
-    
-    # Vector processing branch
-    vec_branch = if !isempty(veckeys)
-        Chain([
-            Chain(
-                Dense(units => units),
-                BatchNorm(units, gelu)
-            ) for _ in 1:layers
-        ]...)
-    else
-        identity
+    depth::Int=64,
+    kernel::Int=5)
+
+
+    # construct the network ---------------------------------------------------
+    depths = [depth * m for m in mults]
+    channels = obs.size[3]
+    layers = []
+    for (d_in, d_out) in zip(vcat(channels,depths[1:end-1]), depths)
+        push!(layers, Conv((kernel, kernel), d_in => d_out, pad=SamePad()))  # Add padding
+        push!(layers, MaxPool((2, 2), stride=(2, 2)))
+        push!(layers, RMSNorm(d_out, act))
     end
+    nn = Chain(layers...)
+
+    # return the encoder ------------------------------------------------------
+    return Encoder(act, mults, depth, kernel, nn)
+end
+
+
+
+enc = Encoder(; obs);
+
+enc.net(rand(UInt8, 96, 96, 1, 1)) 
+
+rng = Random.default_rng();
+ps, state = Lux.setup(rng, enc.net);
+
+
+"""
+Encoder for RSSM
+
+
+    Conv((3, 3), 1 => 64) ------------------------------------------------------
+    kernel = 3, depth = 1 (input channel), d = 64 (output channels)
+    Input Image (1 channel):
+    [
+        1  2  3  4
+        5  6  7  8
+        9  10 11 12
+        13 14 15 16
+    ]
+
+    3x3 Kernel (simplified, showing just one of the 64 output channels):
+    [
+        a b c
+        d e f
+        g h i
+    ]
+
+    Output computation for one position:
+    result = a*1 + b*2 + c*3 +
+            d*5 + e*6 + f*7 +
+            g*9 + h*10 + i*11
+
+    The process repeats with 64 different kernels to produce 64 output channels.
+    --------------------------------------------------------------------------
+
+    MaxPool((2, 2), stride=(2, 2)) ----------------------------------------------
+    Window moves 2 positions each time:
+    [1 2]  [3 4]
+    [5 6]  [7 8]
+    ↓      ↓
+    [9 10]  [11 12]
+    [13 14] [15 16]
+
+    Output (max of each window):
+    6  8
+    14 16
+    --------------------------------------------------------------------------
+
+    RMSNorm(2, 2, 3, 2) ------------------------------------------------------
+    Input Shape: (2, 2, 3, 2)  # (Width, Height, Channels, Batch)
+
+    Batch 1:
+    Channel 1:    Channel 2:    Channel 3:
+    [1  2]       [5  6]       [9   10]
+    [3  4]       [7  8]       [11  12]
+
+    Batch 2:
+    Channel 1:    Channel 2:    Channel 3:
+    [13 14]      [17 18]      [21 22]
+    [15 16]      [19 20]      [23 24]
+
+    Step 1: Calculate mean square (dims=Colon() "all dimentions"):
+    ms = (1² + 2² + 3² + ... + 24²)/24 
+       = (1 + 4 + 9 + ... + 576)/24
+       = 4900/24 
+       ≈ 204.17
+
+    Step 2: Add epsilon and take sqrt for RMS:
+    rms = √(ms + ε)
+
+    Step 3: Normalize by dividing input by RMS:
+    For position (1,1) in Batch 1:
+    y = [
+        Batch 1:
+        Channel 1:           Channel 2:           Channel 3:
+        [1/rms  2/rms]  [5/rms  6/rms]  [9/rms  10/rms]
+        [3/rms  4/rms]  [7/rms  8/rms]  [11/rms 12/rms]
+
+        Batch 2:
+        Channel 1:            Channel 2:            Channel 3:
+        [13/rms 14/rms]  [17/rms 18/rms]  [21/rms 22/rms]
+        [15/rms 16/rms]  [19/rms 20/rms]  [23/rms 24/rms]
+    ]
+
+    Step 4: Apply learnable scale:
+    final = y * scale
+    --------------------------------------------------------------------------
+"""
+function forward(enc::Encoder, state, ps, obs::Dict)
     
-    # Image processing branch
-    img_branch = if !isempty(imgkeys)
-        depths = [depth * m for m in mults]
-        Chain([
-            Chain(
-                if outer && i == 1
-                    Conv((kernel, kernel), 3 => d)
-                elseif strided
-                    Conv((kernel, kernel), (i == 1 ? 3 : depths[i-1]) => d, stride=2)
-                else
-                    Chain(
-                        Conv((kernel, kernel), (i == 1 ? 3 : depths[i-1]) => d),
-                        x -> begin
-                            B, H, W, C = size(x)
-                            x = reshape(x, B, H ÷ 2, 2, W ÷ 2, 2, C)
-                            x = maximum(x, dims=(3, 5))
-                            dropdims(x, dims=(3, 5))
-                        end
-                    )
-                end,
-                BatchNorm(d, gelu)
-            )
-            for (i, d) in enumerate(depths)
-        ]...)
-    else
-        identity
-    end
+    # to do  
+    # - test if input is image or vector (implemented only image)
+    # - implement different types of convolution (e.g. outer, strided)
+
+    imgs = obs[:image]; # image is a 4D array of UInt8 (W, H, C, sequence_length, batch_size)
+    # flatten the sequence and batch dimensions
+    W, H, C, T, B = size(imgs)
+    imgs = reshape(imgs, (W, H, C, T*B));
+    @assert typeof(imgs) == Array{UInt8, 4} "Image must be an array of UInt8"
+    imgs = Float32.(imgs) ./ 255f0 .- 0.5f0;
     
-    return Chain(
-        NamedTuple{(:vec, :img)}((vec_branch, img_branch)),
-        x -> begin
-            outs = []
-            if !isempty(veckeys)
-                vecs = Dict(k => x[k] for k in veckeys)
-                vec_input = reduce(vcat, values(vecs))
-                vec_input = symlog ? symlog.(vec_input) : vec_input
-                push!(outs, vec_branch(vec_input))
-            end
-            
-            if !isempty(imgkeys)
-                imgs = [x[k] for k in sort(imgkeys)]
-                img_input = cat(imgs..., dims=3)
-                img_input = Float32.(img_input) ./ 255f0 .- 0.5f0
-                img_out = img_branch(img_input)
-                img_out = reshape(img_out, :, size(img_out, 4))
-                push!(outs, img_out)
-            end
-            
-            return length(outs) > 1 ? vcat(outs...) : outs[1]
-        end
-    )
+    output, new_state = enc.net(imgs, ps, state);
+    return output, new_state
 end;
+
 
 # Usage example:
 obs_space = Dict(
@@ -86,11 +150,11 @@ obs_space = Dict(
 );
 
 rng = Random.default_rng()
-enc = encoder(rng; obs_space=obs_space)
+enc = encoder(rng; obs=obs_space)
 ps, st = Lux.setup(rng, enc);
 
 # Forward pass
-x = (image = rand(Float32, 64, 64, 3), vector = rand(Float32, 10))
-output, new_st = enc(x, ps, st)
+obs = (image = rand(Float32, 64, 64, 3),);
+output, new_st = enc(obs, ps, st)
 
 

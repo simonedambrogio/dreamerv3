@@ -167,23 +167,31 @@ function encoder(rng=Random.default_rng();
 end;
 
 # Usage example:
-obs_space = Dict(
-    :image => Space(UInt8, (96, 96, 1)),
-);
+obs = Space(UInt8, (96, 96, 1));
 
 units = 1024; depth = 64; mults = (2, 3, 4, 4); layers = 3; kernel = 5; symlog = true; outer = false; strided = false
 rng = Random.default_rng();
 enc = encoder(rng; obs_space=obs_space);
 ps, st = Lux.setup(rng, enc);
-
 # Forward pass
 output, new_st = enc(x, ps, st)
 
+
 batch = 10;
 units = 1024; depth = 64; mults = (2, 3, 4, 4); layers = 3; kernel = 5; symlog = true; outer = false; strided = false
-x = (image = rand(Float32, 64, 64, 1, batch), );
+
+# Debug
+units = 8; depth = 2; mults = (2, 3, 4, 4); layers = 1; kernel = 5; symlog = true; outer = false; strided = false
+
+batch_size = 2;
+batch_length = 4;
+
+obs = (image = rand(UInt8, 64, 64, 1, batch_length, batch_size), );
+
+size(x.image)
 imgs = [x.image];
 img_input = cat(imgs..., dims=3);
+size(img_input)
 img_input = Float32.(img_input) ./ 255f0 .- 0.5f0;
 # img_input = permutedims(img_input, (1, 2, 3, 4));  # Now shape is (W, H, C, N)
 
@@ -200,7 +208,7 @@ layers = []
 for (d_in, d_out) in zip(vcat(C,depths[1:end-1]), depths)
     push!(layers, Conv((kernel, kernel), d_in => d_out, pad=SamePad()))  # Add padding
     push!(layers, MaxPool((2, 2), stride=(2, 2)))
-    push!(layers, RMSNorm(d_out, gelu))
+    push!(layers, RMSNorm(d_out, swish))
 end
 en = Chain(layers...)
 
