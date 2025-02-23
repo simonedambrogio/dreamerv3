@@ -80,7 +80,8 @@ function (l::BlockLinear)(x::AbstractArray, ps, st::NamedTuple)
     
     # Weight should be (out_per_block, in_per_block, blocks)
     weight = permutedims(ps.weight, (3, 2, 1))
-        
+    
+    # Perform the block-wise multiplication
     y = batched_mul(weight, x_batched)
     
     # Reshape output to (features, batch...)

@@ -1,5 +1,6 @@
 using Lux, NNlib, Random, Tools
 include("../embodied/lux/RMSNorm.jl")
+include("../embodied/lux/BlockLinear.jl")
 
 """
 Encoder for RSSM

@@ -12,8 +12,12 @@
     - ~~implements bfloat16 initialization of weights~~ ✅
 
 - implement the Decoder, and test its output with the original implementation
-    - reshape input appropriately
-    - implement nn.BlockLinear in Lux
+    - ~~reshape input appropriately~~ ✅
+    - ~~implement nn.BlockLinear in Lux~~ ✅
+    - ~~implement nn.ReArrange in Lux~~ ✅
+    - implement decoder forward pass
+
+- FIX RMSNorm. RMSNorm is not working properly: RMSNorm-old works with encoder (high dim input) but not with decoder (low dim input), and RMSNorm works with decoder (low dim input) but not with encoder (high dim input).
 
 
 **Secondary goal**

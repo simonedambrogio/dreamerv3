@@ -1,5 +1,5 @@
 using Lux, NNlib, Random, Tools
-include("../embodied/lux/RMSNorm.jl");
+include("../embodied/lux/RMSNorm-old.jl");
 include("../embodied/lux/nets.jl");
 
 struct Encoder

@@ -22,4 +22,3 @@ end
 cast_glorot_uniform(rng::AbstractRNG, dims...) = cast(glorot_uniform(rng, dims...))
 
 cast_ones(rng::AbstractRNG, dims...) = cast(ones(dims...))
-

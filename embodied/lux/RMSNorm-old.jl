@@ -38,50 +38,50 @@ where ``\gamma`` is a trainable scale parameter if `affine=true`.
     Advances in Neural Information Processing Systems 32 (2019).
 """
 @concrete struct RMSNorm <: AbstractLuxLayer
-    shape::Int  # feature dimension size
-    eps::Float32
-    scale::Bool
+    shape
     activation
+    epsilon
     init_scale
+    dims
+    affine <: StaticBool
 end
 
-function RMSNorm(shape::Int, activation=identity;
-                 eps::Float32=1f-4,
-                 scale::Bool=true,
-                 init_scale=ones32)
-    return RMSNorm(shape, eps, scale, activation, init_scale)
+function RMSNorm(shape, activation=identity; epsilon=1.0f-5, dims=Colon(),
+        affine::BoolType=True(), init_scale=ones32)
+    return RMSNorm(shape, activation, epsilon, init_scale, dims, static(affine))
 end
 
-function Lux.initialparameters(rng::AbstractRNG, l::RMSNorm)
-    if l.scale
-        # Initialize scale parameter for feature dimension
-        return (scale=l.init_scale(rng, l.shape),)
-    else
-        return NamedTuple()
+function Lux.initialparameters(rng::AbstractRNG, rn::RMSNorm)
+    if has_affine(rn)
+        dims = rn.shape
+        return (; scale=rn.init_scale(rng, dims...))
     end
-end
-
-Lux.initialstates(::AbstractRNG, ::RMSNorm) = NamedTuple()
+    return (;)
+end;
 
 function (l::RMSNorm)(x::AbstractArray, ps, st::NamedTuple)
-    # Compute RMS along feature dimension (dim=1 in Lux)
-    mean2 = mean(abs2.(x), dims=1)
+    x′ = match_eltype(l, ps, st, x)
     
-    # Normalize
-    x_norm = x .* (1 ./ sqrt.(mean2 .+ l.eps))
+    # Calculate RMS statistics
+    # For a (features, batch) input, we want to normalize each batch sample independently
+    ms = mean(abs2.(x′), dims=l.dims)
+    rms = sqrt.(ms .+ convert(unwrapped_eltype(x′), l.epsilon))
     
-    # Apply scale if enabled
-    if l.scale
-        x_norm = x_norm .* reshape(ps.scale, :, ones(Int, ndims(x_norm)-1)...)
+    # Normalize and scale
+    y = x′ ./ rms
+    if has_affine(l)
+        scale = reshape(safe_getproperty(ps, Val(:scale)), (1, 1, :, 1))
+        y = y .* scale
     end
     
     # Apply activation
-    return l.activation.(x_norm), st
+    y = NNlib.fast_act(l.activation, y)(y)
+    return y, st
 end
 
 function Base.show(io::IO, l::RMSNorm)
     print(io, "RMSNorm($(l.shape)")
     (l.activation == identity) || print(io, ", $(l.activation)")
-    print(io, ", affine=$(l.scale), eps=$(l.eps)")
+    print(io, ", affine=$(has_affine(l)), dims=$(l.dims)")
     return print(io, ")")
 end
