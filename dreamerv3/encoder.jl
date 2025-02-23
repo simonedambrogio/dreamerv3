@@ -1,6 +1,6 @@
 using Lux, NNlib, Random, Tools
-include("../embodied/lux/RMSNorm.jl")
-
+include("../embodied/lux/RMSNorm.jl");
+include("../embodied/lux/nets.jl");
 
 struct Encoder
     act::Function
@@ -9,7 +9,6 @@ struct Encoder
     kernel::Int
     net::Chain
 end
-
 
 function Encoder(;
     obs::Space,
@@ -24,25 +23,15 @@ function Encoder(;
     channels = obs.size[3]
     layers = []
     for (d_in, d_out) in zip(vcat(channels,depths[1:end-1]), depths)
-        push!(layers, Conv((kernel, kernel), d_in => d_out, pad=SamePad()))  # Add padding
+        push!(layers, Conv((kernel, kernel), d_in => d_out, pad=SamePad(); init_weight=cast_glorot_uniform, init_bias=cast_zeros))  # Add padding
         push!(layers, MaxPool((2, 2), stride=(2, 2)))
-        push!(layers, RMSNorm(d_out, act))
+        push!(layers, RMSNorm(d_out, act; init_scale=cast_ones))
     end
     nn = Chain(layers...)
 
     # return the encoder ------------------------------------------------------
     return Encoder(act, mults, depth, kernel, nn)
 end
-
-
-
-enc = Encoder(; obs);
-
-enc.net(rand(UInt8, 96, 96, 1, 1)) 
-
-rng = Random.default_rng();
-ps, state = Lux.setup(rng, enc.net);
-
 
 """
 Encoder for RSSM
@@ -125,8 +114,10 @@ Encoder for RSSM
     Step 4: Apply learnable scale:
     final = y * scale
     --------------------------------------------------------------------------
+
+    The outputs is a 3D array of size (embedding_dim, T, B)
 """
-function forward(enc::Encoder, state, ps, obs::Dict)
+function forward(enc::Encoder, state, ps, obs)
     
     # to do  
     # - test if input is image or vector (implemented only image)
@@ -134,27 +125,45 @@ function forward(enc::Encoder, state, ps, obs::Dict)
 
     imgs = obs[:image]; # image is a 4D array of UInt8 (W, H, C, sequence_length, batch_size)
     # flatten the sequence and batch dimensions
-    W, H, C, T, B = size(imgs)
+    W, H, C, T, B = size(imgs);
     imgs = reshape(imgs, (W, H, C, T*B));
     @assert typeof(imgs) == Array{UInt8, 4} "Image must be an array of UInt8"
-    imgs = Float32.(imgs) ./ 255f0 .- 0.5f0;
+    imgs = cast.(imgs) ./ cast(255) .- cast(0.5);
     
     output, new_state = enc.net(imgs, ps, state);
+
+    # Reshape the output to be a 3D array of size (embedding_dim, T, B)
+    W, H, C, A = size(output);
+    println("W, H, C, A: $W, $H, $C, $A")
+    WHC = W*H*C
+    output = reshape(output, (WHC, A));
+    output = reshape(output, (WHC, T, B))
+
     return output, new_state
 end;
 
-
-# Usage example:
+# Usage example with debug parameters:
 obs_space = Dict(
     :image => Tools.Space(UInt8, (96, 96, 1)),
 );
 
-rng = Random.default_rng()
-enc = encoder(rng; obs=obs_space)
-ps, st = Lux.setup(rng, enc);
+rng = Random.default_rng();
+enc = Encoder(; obs=obs_space[:image], kernel=5, depth=2);
+ps, st = Lux.setup(rng, enc.net);
+
 
 # Forward pass
-obs = (image = rand(Float32, 64, 64, 3),);
-output, new_st = enc(obs, ps, st)
+seq_length = 10;
+batch_size = 8;
+obs = (image = rand(UInt8, 96, 96, 1, seq_length, batch_size),);
+output, new_st = forward(enc, st, ps, obs);
+size(output)
+typeof(output)
 
+
+# # enc = Lux.bf16(enc)
+# ps, st = Lux.setup(rng, enc.net);
+# output, new_st = forward(enc, st, ps, obs);
+# size(output)
+# typeof(output)
 

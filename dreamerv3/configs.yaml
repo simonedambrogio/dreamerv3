@@ -3,5 +3,55 @@ defaults:
   env:
     atari: {size: [96, 96], repeat: 4, sticky: True, gray: True, actions: all, lives: unused, noops: 30, autostart: False, pooling: 2, aggregate: max, resize: pillow, clip_reward: False}
 
+  agent:
+    loss_scales: {rec: 1.0, rew: 1.0, con: 1.0, dyn: 1.0, rep: 0.1, policy: 1.0, value: 1.0, repval: 0.3}
+    opt: {lr: 4e-5, agc: 0.3, eps: 1e-20, beta1: 0.9, beta2: 0.999, momentum: True, wd: 0.0, schedule: const, warmup: 1000, anneal: 0}
+    ac_grads: False
+    dyn:
+      typ: rssm
+      rssm: {deter: 8192, hidden: 1024, stoch: 32, classes: 64, act: silu, norm: rms, unimix: 0.01, outscale: 1.0, winit: trunc_normal_in, imglayers: 2, obslayers: 1, dynlayers: 1, absolute: False, blocks: 8, free_nats: 1.0}
+    enc:
+      typ: simple
+      simple: {depth: 64, mults: [2, 3, 4, 4], layers: 3, units: 1024, act: silu, norm: rms, winit: trunc_normal_in, symlog: True, outer: False, kernel: 5, strided: False}
+    dec:
+      typ: simple
+      simple: {depth: 64, mults: [2, 3, 4, 4], layers: 3, units: 1024, act: silu, norm: rms, outscale: 1.0, winit: trunc_normal_in, outer: False, kernel: 5, bspace: 8, strided: False}
+    rewhead: {layers: 1, units: 1024, act: silu, norm: rms, output: symexp_twohot, outscale: 0.0, winit: trunc_normal_in, bins: 255}
+    conhead: {layers: 1, units: 1024, act: silu, norm: rms, output: binary, outscale: 1.0, winit: trunc_normal_in}
+    policy: {layers: 3, units: 1024, act: silu, norm: rms, minstd: 0.1, maxstd: 1.0, outscale: 0.01, unimix: 0.01, winit: trunc_normal_in}
+    value: {layers: 3, units: 1024, act: silu, norm: rms, output: symexp_twohot, outscale: 0.0, winit: trunc_normal_in, bins: 255}
+    policy_dist_disc: categorical
+    policy_dist_cont: bounded_normal
+    imag_last: 0
+    imag_length: 15
+    horizon: 333
+    contdisc: True
+    imag_loss: {slowtar: False, lam: 0.95, actent: 3e-4, slowreg: 1.0}
+    repl_loss: {slowtar: False, lam: 0.95, slowreg: 1.0}
+    slowvalue: {rate: 0.02, every: 1}
+    retnorm: {impl: perc, rate: 0.01, limit: 1.0, perclo: 5.0, perchi: 95.0, debias: False}
+    valnorm: {impl: none, rate: 0.01, limit: 1e-8}
+    advnorm: {impl: none, rate: 0.01, limit: 1e-8}
+    reward_grad: True
+    repval_loss: True
+    repval_grad: True
+    report: True
+    report_gradnorms: False
 
-
+debug:
+  batch_size: 8
+  batch_length: 10
+  report_length: 5
+  jax: {platform: cpu, debug: True, prealloc: False}
+  run: {envs: 4, report_every: 10, log_every: 5, save_every: 15, train_ratio: 8, debug: True}
+  replay.size: 1e4
+  agent:
+    .*\.bins: 5
+    .*\.layers: 1
+    .*\.units: 8
+    .*\.stoch: 2
+    .*\.classes: 4
+    .*\.deter: 8
+    .*\.hidden: 3
+    .*\.blocks: 4
+    .*\.depth: 2

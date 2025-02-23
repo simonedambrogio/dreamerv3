@@ -182,10 +182,8 @@ units = 1024; depth = 64; mults = (2, 3, 4, 4); layers = 3; kernel = 5; symlog =
 
 # Debug
 units = 8; depth = 2; mults = (2, 3, 4, 4); layers = 1; kernel = 5; symlog = true; outer = false; strided = false
-
 batch_size = 2;
 batch_length = 4;
-
 obs = (image = rand(UInt8, 64, 64, 1, batch_length, batch_size), );
 
 size(x.image)
