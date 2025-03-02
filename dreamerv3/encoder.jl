@@ -1,5 +1,7 @@
 using Lux, NNlib, Random, Tools
 include("../embodied/lux/RMSNorm-old.jl");
+include("../embodied/lux/RMSNorm.jl");
+include("../embodied/lux/rms.jl");
 include("../embodied/lux/nets.jl");
 
 struct Encoder
@@ -25,7 +27,8 @@ function Encoder(;
     for (d_in, d_out) in zip(vcat(channels,depths[1:end-1]), depths)
         push!(layers, Conv((kernel, kernel), d_in => d_out, pad=SamePad(); init_weight=cast_glorot_uniform, init_bias=cast_zeros))  # Add padding
         push!(layers, MaxPool((2, 2), stride=(2, 2)))
-        push!(layers, RMSNorm(d_out, act; init_scale=cast_ones))
+        # Normalize along the channel dimension
+        push!(layers, RMSNorm((d_out,), dims=(3,), act; init_scale=cast_ones))
     end
     nn = Chain(layers...)
 
@@ -117,7 +120,8 @@ Encoder for RSSM
 
     The outputs is a 3D array of size (embedding_dim, T, B)
 """
-function forward(enc::Encoder, state, ps, obs)
+function (enc::Encoder)(state, ps, obs)
+# function forward(enc::Encoder, state, ps, obs)
     
     # to do  
     # - test if input is image or vector (implemented only image)
@@ -156,9 +160,49 @@ ps, st = Lux.setup(rng, enc.net);
 seq_length = 10;
 batch_size = 8;
 obs = (image = rand(UInt8, 96, 96, 1, seq_length, batch_size),);
-output, new_st = forward(enc, st, ps, obs);
+output, new_st = enc(st, ps, obs);
 size(output)
 typeof(output)
+
+imgs = obs[:image]; # image is a 4D array of UInt8 (W, H, C, sequence_length, batch_size)
+# flatten the sequence and batch dimensions
+W, H, C, T, B = size(imgs);
+imgs = reshape(imgs, (W, H, C, T*B));
+imgs = cast.(imgs) ./ cast(255) .- cast(0.5);
+
+ps, st = Lux.setup(rng, enc.net.layer_1)
+out = enc.net.layer_1(imgs, ps, st)[1];
+size(out)
+
+ps, st = Lux.setup(rng, enc.net.layer_2)
+out = enc.net.layer_2(out, ps, st)[1];
+size(out)
+
+
+ps, st = Lux.setup(rng, enc.net.layer_3)
+out = enc.net.layer_3(out, ps, st)[1];
+size(out)
+
+rms = sqrt.(mean(abs2.(out), dims=1))
+println("RMS values should be close to 1: ", mean(rms))
+println("RMS std deviation: ", std(rms))
+
+
+# Test RMSNorm
+rng = Random.default_rng();
+x = rand(rng, Float32, 46, 46, 4, 80);
+# For image data, we typically want to normalize across spatial and channel dimensions
+# but not across the batch dimension
+dims = (1, 2, 3)  # Normalize across height, width, and channels
+
+rmsn = RMSNorm((46, 46, 4), dims);
+ps, st = Lux.setup(rng,rmsn);
+out, st = rmsn(x, ps, st);
+size(out)
+# Test RMSNorm
+
+
+
 
 
 # # enc = Lux.bf16(enc)

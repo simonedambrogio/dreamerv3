@@ -1,4 +1,4 @@
-using Lux, NNlib, Random, Tools, BFloat16s, YAML
+using Lux, NNlib, Random, Tools, BFloat16s, YAML, Statistics
 include("../embodied/lux/RMSNorm.jl");
 include("../embodied/lux/nets.jl");
 include("../embodied/lux/BlockLinear.jl");
@@ -74,7 +74,7 @@ function Decoder(;
     # x1 dimension: (stoch_vars x classes_per_vars, seq_length x batch_size)
     spatialize_stoch = Chain(
         Dense(stoch_vars * classes_per_vars, 2units, act),
-        RMSNorm(2units)
+        # RMSNorm(2units)
     );
     
     
@@ -111,8 +111,8 @@ function Decoder(;
     return Decoder(act, mults, depth, kernel, nn, obs, Tuple(depths), shape, bspace, deter_dim)
 end
 
-b = batch_size = config["debug"]["batch_size"];
-t = seq_length = config["debug"]["batch_length"];
+B = batch_size = config["debug"]["batch_size"];
+T = seq_length = config["debug"]["batch_length"];
 deter_dim = config["debug"]["agent"][".*\\.deter"];
 obs = Tools.Space(UInt8, (96, 96, 1));
 depth = config["debug"]["agent"][".*\\.depth"];
@@ -126,7 +126,7 @@ kernel=5
 bspace=8
 
 rng = Random.default_rng();
-dec = Decoder(; obs, depth, units, stoch_vars, classes_per_vars);
+dec = Decoder(; obs, deter_dim, depth, units, stoch_vars, classes_per_vars);
 
 
 feat = Dict(
@@ -139,7 +139,7 @@ reset = rand(rng, Bool, seq_length, batch_size);
 """
 Decoder for RSSM
 """
-function forward(dec::Decoder, state, ps, feat, reset)
+function (dec::Decoder)(state, ps, feat, reset)
     
     bshape = size(reset); # sequence length, batch size
     u, g = prod(dec.shape), dec.bspace;
@@ -151,7 +151,6 @@ function forward(dec::Decoder, state, ps, feat, reset)
     x1 = reshape(x1, (size(x1, 1), :));
     
     
-
     # 4. Calculate the final spatial dimensions after all CNN layers
 
     # inp = [cast(feat[k]) for k in ("stoch", "deter")]; 

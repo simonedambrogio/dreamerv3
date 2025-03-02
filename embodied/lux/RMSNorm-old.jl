@@ -53,24 +53,50 @@ end
 
 function Lux.initialparameters(rng::AbstractRNG, rn::RMSNorm)
     if has_affine(rn)
-        dims = rn.shape
-        return (; scale=rn.init_scale(rng, dims...))
+        # If shape is a tuple, we need to handle it differently
+        if rn.shape isa Tuple
+            # For a tuple shape like (46, 46, 4), we typically want the scale
+            # to be the size of the feature dimension (4 in this case)
+            if length(rn.shape) == 3 && rn.dims == (1, 2, 3)
+                # Initialize scale for each channel
+                return (; scale=rn.init_scale(rng, rn.shape[3]))
+            else
+                # Default case - initialize with the full shape
+                return (; scale=rn.init_scale(rng, rn.shape...))
+            end
+        else
+            # Original behavior for scalar shape
+            return (; scale=rn.init_scale(rng, rn.shape))
+        end
     end
     return (;)
-end;
+end
 
 function (l::RMSNorm)(x::AbstractArray, ps, st::NamedTuple)
     x′ = match_eltype(l, ps, st, x)
     
     # Calculate RMS statistics
-    # For a (features, batch) input, we want to normalize each batch sample independently
     ms = mean(abs2.(x′), dims=l.dims)
     rms = sqrt.(ms .+ convert(unwrapped_eltype(x′), l.epsilon))
     
     # Normalize and scale
     y = x′ ./ rms
     if has_affine(l)
-        scale = reshape(safe_getproperty(ps, Val(:scale)), (1, 1, :, 1))
+        # For 4D input (H, W, C, B) with dims=(1,2,3)
+        # We want to apply scale to each channel
+        scale = safe_getproperty(ps, Val(:scale))
+        
+        # For a 4D input where we normalize across dims 1,2,3
+        # The scale should be applied to each feature but be the same across batch
+        if ndims(x′) == 4 && l.dims == (1, 2, 3)
+            # Reshape to (1, 1, C, 1) for broadcasting
+            scale = reshape(scale, (1, 1, length(scale), 1))
+        else
+            # For other cases, just reshape to a scalar for now
+            # This is a fallback that might need to be expanded for other use cases
+            scale = reshape(scale, 1)
+        end
+        
         y = y .* scale
     end
     
