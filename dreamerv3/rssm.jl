@@ -167,127 +167,127 @@ function encoder(rng=Random.default_rng();
     )
 end;
 
-# Usage example:
-obs = Space(UInt8, (96, 96, 1));
+# # Usage example:
+# obs = Space(UInt8, (96, 96, 1));
 
-units = 1024; depth = 64; mults = (2, 3, 4, 4); layers = 3; kernel = 5; symlog = true; outer = false; strided = false
-rng = Random.default_rng();
-enc = encoder(rng; obs_space=obs_space);
-ps, st = Lux.setup(rng, enc);
-# Forward pass
-output, new_st = enc(x, ps, st)
-
-
-batch = 10;
-units = 1024; depth = 64; mults = (2, 3, 4, 4); layers = 3; kernel = 5; symlog = true; outer = false; strided = false
-
-# Debug
-units = 8; depth = 2; mults = (2, 3, 4, 4); layers = 1; kernel = 5; symlog = true; outer = false; strided = false
-batch_size = 2;
-batch_length = 4;
-obs = (image = rand(UInt8, 64, 64, 1, batch_length, batch_size), );
-
-size(x.image)
-imgs = [x.image];
-img_input = cat(imgs..., dims=3);
-size(img_input)
-img_input = Float32.(img_input) ./ 255f0 .- 0.5f0;
-# img_input = permutedims(img_input, (1, 2, 3, 4));  # Now shape is (W, H, C, N)
-
-depths = [depth * m for m in mults]
-(i, d) = first(enumerate(depths))
-
-d_in, d_out = first(zip(
-    vcat(size(img_input, 3), depths[1:end-1]), 
-    depths
-))
-W,H,C,N = size(img_input)
-
-layers = []
-for (d_in, d_out) in zip(vcat(C,depths[1:end-1]), depths)
-    push!(layers, Conv((kernel, kernel), d_in => d_out, pad=SamePad()))  # Add padding
-    push!(layers, MaxPool((2, 2), stride=(2, 2)))
-    push!(layers, RMSNorm(d_out, swish))
-end
-en = Chain(layers...)
+# units = 1024; depth = 64; mults = (2, 3, 4, 4); layers = 3; kernel = 5; symlog = true; outer = false; strided = false
+# rng = Random.default_rng();
+# enc = encoder(rng; obs_space=obs_space);
+# ps, st = Lux.setup(rng, enc);
+# # Forward pass
+# output, new_st = enc(x, ps, st)
 
 
-rng = Random.default_rng();
-ps, st = Lux.setup(rng, en);
-output, new_st = en(img_input, ps, st);
-size(output)
+# batch = 10;
+# units = 1024; depth = 64; mults = (2, 3, 4, 4); layers = 3; kernel = 5; symlog = true; outer = false; strided = false
 
-norm = RMSNorm((depths[i], ))
-ps, st = Lux.setup(rng, norm);
-# output, new_st = norm(output, ps, st);
+# # Debug
+# units = 8; depth = 2; mults = (2, 3, 4, 4); layers = 1; kernel = 5; symlog = true; outer = false; strided = false
+# batch_size = 2;
+# batch_length = 4;
+# obs = (image = rand(UInt8, 64, 64, 1, batch_length, batch_size), );
+
+# size(x.image)
+# imgs = [x.image];
+# img_input = cat(imgs..., dims=3);
+# size(img_input)
+# img_input = Float32.(img_input) ./ 255f0 .- 0.5f0;
+# # img_input = permutedims(img_input, (1, 2, 3, 4));  # Now shape is (W, H, C, N)
+
+# depths = [depth * m for m in mults]
+# (i, d) = first(enumerate(depths))
+
+# d_in, d_out = first(zip(
+#     vcat(size(img_input, 3), depths[1:end-1]), 
+#     depths
+# ))
+# W,H,C,N = size(img_input)
+
+# layers = []
+# for (d_in, d_out) in zip(vcat(C,depths[1:end-1]), depths)
+#     push!(layers, Conv((kernel, kernel), d_in => d_out, pad=SamePad()))  # Add padding
+#     push!(layers, MaxPool((2, 2), stride=(2, 2)))
+#     push!(layers, RMSNorm(d_out, swish))
+# end
+# en = Chain(layers...)
 
 
+# rng = Random.default_rng();
+# ps, st = Lux.setup(rng, en);
+# output, new_st = en(img_input, ps, st);
+# size(output)
+
+# norm = RMSNorm((depths[i], ))
+# ps, st = Lux.setup(rng, norm);
+# # output, new_st = norm(output, ps, st);
 
 
 
 
 
 
-x′ = match_eltype(norm, ps, st, output);
 
-# Calculate RMS statistics over specified dimensions
-ms = mean(abs2.(x′), dims=norm.dims)
-rms = sqrt.(ms .+ convert(unwrapped_eltype(x′), norm.epsilon))
 
-y = x′ ./ rms;
-scale = reshape(safe_getproperty(ps, Val(:scale)), (1, 1, :, 1))
+# x′ = match_eltype(norm, ps, st, output);
 
-y = y .* scale;
-size(y)
+# # Calculate RMS statistics over specified dimensions
+# ms = mean(abs2.(x′), dims=norm.dims)
+# rms = sqrt.(ms .+ convert(unwrapped_eltype(x′), norm.epsilon))
 
-# 1. Check RMS (Root Mean Square) of normalized output
-# Should be close to 1 along normalized dimensions
-function check_rms(x, dims)
-    ms = mean(abs2.(x), dims=dims)
-    rms = sqrt.(ms)
-    println("RMS values mean: ", mean(rms))
-    println("RMS values std: ", Statistics.std(rms))
-    # Should be close to 1 if normalized correctly
-end
+# y = x′ ./ rms;
+# scale = reshape(safe_getproperty(ps, Val(:scale)), (1, 1, :, 1))
 
-# 2. Check scale of values before and after
-println("\nBefore normalization:")
-println("Mean: ", mean(output))
-println("Std: ", std(output))
+# y = y .* scale;
+# size(y)
 
-# Apply normalization
-x′ = match_eltype(norm, ps, st, output);
-ms = mean(abs2.(x′), dims=norm.dims);
-rms = sqrt.(ms .+ convert(unwrapped_eltype(x′), norm.epsilon));
-y = x′ ./ rms;
-scale = reshape(safe_getproperty(ps, Val(:scale)), (1, 1, :, 1))
-y = y .* scale;
+# # 1. Check RMS (Root Mean Square) of normalized output
+# # Should be close to 1 along normalized dimensions
+# function check_rms(x, dims)
+#     ms = mean(abs2.(x), dims=dims)
+#     rms = sqrt.(ms)
+#     println("RMS values mean: ", mean(rms))
+#     println("RMS values std: ", Statistics.std(rms))
+#     # Should be close to 1 if normalized correctly
+# end
 
-println("\nAfter normalization:")
-println("Mean: ", mean(output))
-println("Std: ", Statistics.std(output))
+# # 2. Check scale of values before and after
+# println("\nBefore normalization:")
+# println("Mean: ", mean(output))
+# println("Std: ", std(output))
 
-# 3. Check RMS of normalized output
-println("\nRMS check of normalized output:")
-check_rms(y, norm.dims)
+# # Apply normalization
+# x′ = match_eltype(norm, ps, st, output);
+# ms = mean(abs2.(x′), dims=norm.dims);
+# rms = sqrt.(ms .+ convert(unwrapped_eltype(x′), norm.epsilon));
+# y = x′ ./ rms;
+# scale = reshape(safe_getproperty(ps, Val(:scale)), (1, 1, :, 1))
+# y = y .* scale;
 
-# 4. Verify that relative relationships are preserved
-println("\nCorrelation between input and output:")
-println(cor(vec(output), vec(y)))
+# println("\nAfter normalization:")
+# println("Mean: ", mean(output))
+# println("Std: ", Statistics.std(output))
 
-# Chain([
-#     Chain(
-#         Chain(
-#             Conv((kernel, kernel), (i == 1 ? 3 : depths[i-1]) => d)(img_input),
-#             x -> begin
+# # 3. Check RMS of normalized output
+# println("\nRMS check of normalized output:")
+# check_rms(y, norm.dims)
 
-#                 B, H, W, C = size(x)
-#                 x = reshape(x, B, H ÷ 2, 2, W ÷ 2, 2, C)
-#                 x = maximum(x, dims=(3, 5))
-#                 dropdims(x, dims=(3, 5))
-#             end
-#         ),
-#         BatchNorm(d, gelu)
-#     )
-#     for (i, d) in enumerate(depths)
-# ]...)
+# # 4. Verify that relative relationships are preserved
+# println("\nCorrelation between input and output:")
+# println(cor(vec(output), vec(y)))
+
+# # Chain([
+# #     Chain(
+# #         Chain(
+# #             Conv((kernel, kernel), (i == 1 ? 3 : depths[i-1]) => d)(img_input),
+# #             x -> begin
+
+# #                 B, H, W, C = size(x)
+# #                 x = reshape(x, B, H ÷ 2, 2, W ÷ 2, 2, C)
+# #                 x = maximum(x, dims=(3, 5))
+# #                 dropdims(x, dims=(3, 5))
+# #             end
+# #         ),
+# #         BatchNorm(d, gelu)
+# #     )
+# #     for (i, d) in enumerate(depths)
+# # ]...)

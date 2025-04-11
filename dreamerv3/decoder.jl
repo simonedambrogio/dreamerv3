@@ -1,5 +1,6 @@
 using Lux, NNlib, Random, Tools, BFloat16s, YAML, Statistics
-include("../embodied/lux/RMSNorm.jl");
+# include("../embodied/lux/RMSNorm.jl");
+include("../embodied/lux/rms.jl");
 include("../embodied/lux/nets.jl");
 include("../embodied/lux/BlockLinear.jl");
 include("../embodied/lux/ReArrange.jl");
@@ -17,6 +18,7 @@ struct Decoder
     bspace
     deter_dim::Int
 end
+
 
 function Decoder(;
     obs::Space,
@@ -55,6 +57,7 @@ function Decoder(;
     # it bridges the gap between the flat state representation (from the RSSM) and 
     # the spatial structure needed for image generation through the decoder's 
     # convolutional layers.
+    # This is going to be applied to the deter part of the state
     spatialize_deter = Chain(
         # BlockLinear layer transforms the latent vector into spatial features:
         # Input:  (deter_dim, batch*seq)        # e.g. (8, 80) for batch=8, seq=10
@@ -72,23 +75,57 @@ function Decoder(;
     # 2. Spatialize the stochastic variables (stoch_vars, classes_per_vars, seq_length, batch_size)
     # to feed into the CNN
     # x1 dimension: (stoch_vars x classes_per_vars, seq_length x batch_size)
+    # This is going to be applied to the stoch part of the state
     spatialize_stoch = Chain(
-        Dense(stoch_vars * classes_per_vars, 2units, act),
-        # RMSNorm(2units)
+        # Dense layer transforms the stochastic variables into spatial features:
+        Dense(stoch_vars * classes_per_vars, 2units, act), # Output: (2*units, batch*seq) # sp1
+        # Normalize along feature dim (dim 1), includes activation
+        RMSNorm((2 * units,), act; dims=(1,), init_scale=cast_ones), # sp1norm
+        # Dense layer transforms the stochastic variables into spatial features:
+        Dense(2units, prod(shape), act), ReArrange((w, h, c, :)) # sp2
     );
     
-    
-    ps, st = Lux.setup(rng, spatialize_stoch);
-    x = rand32(stoch_vars * classes_per_vars, seq_length * batch_size);
-    y, st = spatialize_stoch(x, ps, st);
+   
+    # Test BlockLinear --------------------------------------------------------
+    bl = BlockLinear(deter_dim, u, g)
+    ps, st = Lux.setup(rng, bl);
+    x = rand32(deter_dim, seq_length * batch_size);
+    y, st = bl(x, ps, st);
     size(y)
 
-    # 1. Check RMS (root mean square) is approximately 1 along feature dimension
-    rms = sqrt.(mean(abs2.(y), dims=1))
-    println("RMS values should be close to 1: ", mean(rms))
-    println("RMS std deviation: ", std(rms))
+    # Test ReArrange -----------------------------------------------------------
+    r = ReArrange((w, h, c, :))
+    ps, st = Lux.setup(rng, r);
+    y, st = r(y, ps, st);
+    size(y)
+    
 
-    layers = []
+    # Test Linear -------------------------------------------------------------
+    l = Dense(stoch_vars * classes_per_vars, 2units, act)
+    ps, st = Lux.setup(rng, l);
+    x = rand32(stoch_vars * classes_per_vars, seq_length * batch_size);
+    y, st = l(x, ps, st);
+    size(y)
+
+    # Test RMSNorm -------------------------------------------------------------
+    rn = RMSNorm((2units,), act; dims = (1,), init_scale=cast_ones)
+    ps, st = Lux.setup(rng, rn);
+    y, st = rn(y, ps, st);
+    size(y)
+
+    # Test Dense + Reshape -----------------------------------------------------
+    # Implement a Dense layer that takes as input the stoch part of the state
+    # of size 16, 80 (16 = stoch_vars * classes_per_vars, 80 = T * B) and outputs a vector of size 
+    # shape (where shape is defined above, and for instance is (6, 6, 8)). So the input
+    # goes from 16 to 6, 6, 8 so the final output dimention is 6, 6, 8, 80 (a 4 dimentional array)
+    x = rand32(16, 80);
+    l = Chain(Dense(16 => u, act), ReArrange((w, h, c, :)))
+    ps, st = Lux.setup(rng, l);
+    y, st = l(x, ps, st);
+    size(y)
+
+    
+    # layers = []
     
     # l = Chain(
     #     BlockLinear(deter_dim, u, g),
@@ -99,13 +136,13 @@ function Decoder(;
     # y, st = l(x, ps, st)
     # size(y)
 
-    channels = obs.size[3]
-    for (d_in, d_out) in zip(vcat(channels,depths[1:end-1]), depths)
-        push!(layers, Conv((kernel, kernel), d_in => d_out, pad=SamePad()))  # Add padding
-        push!(layers, MaxPool((2, 2), stride=(2, 2)))
-        push!(layers, RMSNorm(d_out, act))
-    end
-    nn = Chain(layers...)
+    # channels = obs.size[3]
+    # for (d_in, d_out) in zip(vcat(channels,depths[1:end-1]), depths)
+    #     push!(layers, Conv((kernel, kernel), d_in => d_out, pad=SamePad()))  # Add padding
+    #     push!(layers, MaxPool((2, 2), stride=(2, 2)))
+    #     push!(layers, RMSNorm(d_out, act))
+    # end
+    # nn = Chain(layers...)
 
     # return the encoder ------------------------------------------------------
     return Decoder(act, mults, depth, kernel, nn, obs, Tuple(depths), shape, bspace, deter_dim)
@@ -143,13 +180,14 @@ function (dec::Decoder)(state, ps, feat, reset)
     
     bshape = size(reset); # sequence length, batch size
     u, g = prod(dec.shape), dec.bspace;
-    x0, x1 = feat["deter"], feat["stoch"];
-    # x0 (deter): (8, 10, 8)        # deter_dim, batch, length
-    # x1 (stoch): (8, 10, 2, 4)     # stoch_vars, classes, batch, length
-    x1 = reshape(x1, (:, size(x1)[end-1:end]...));
-    x0 = reshape(x0, (size(x0, 1), :));
-    x1 = reshape(x1, (size(x1, 1), :));
-    
+    deter, stoch = feat["deter"], feat["stoch"];
+    # x0 (deter): (8, 10, 8)        # deter_dim, length, batch
+    # x1 (stoch): (2, 4, 10, 8)     # stoch_vars, classes, length, batch
+    stoch = reshape(stoch, (:, size(stoch)[end-1:end]...)); # (2, 4, 10, 8) -> (8, 10, 8) 
+    stoch = reshape(stoch, (size(stoch, 1), :)); # (8, 10, 8) -> (8, 80)
+    deter = reshape(deter, (size(deter, 1), :)); # (8, 10, 8) -> (8, 80)
+    x = vcat(stoch, deter); # (16, 80)
+
     
     # 4. Calculate the final spatial dimensions after all CNN layers
 

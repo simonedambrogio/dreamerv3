@@ -75,77 +75,89 @@ function Lux.initialparameters(rng::AbstractRNG, rn::RMSNorm)
     if _affine(rn)
         # If affine=true, create a scale parameter initialized with the provided function
         # This scale parameter will be learned during training
-        scale = rn.init_scale(rng, rn.shape..., 1)
-        return scale  # Return just the scale parameter
+        # Use the compute type defined in nets.jl if possible, otherwise default to Float32
+        compute_T = isdefined(@__MODULE__, :COMPUTE_TYPE) ? COMPUTE_TYPE : Float32
+        scale = rn.init_scale(rng, compute_T, rn.shape..., 1) # Ensure scale is compute_T
+        return (; scale=scale,) # Return NamedTuple consistent with Lux convention
     else
         # If affine=false, no learnable parameters are needed
-        return Float32[]  # Return an empty array
+        return NamedTuple() # Return empty NamedTuple consistent with Lux
     end
 end
 
-function (l::RMSNorm)(x::AbstractArray, ps, st::NamedTuple)
+function (l::RMSNorm)(x::AbstractArray{T}, ps, st::NamedTuple) where T
     # Step 1: Compute the mean of squared values (mean square)
     mean_square = mean(abs2.(x); dims=l.dims)
-    
-    # Step 2: Calculate the scaling factor
-    scale_factor = 1.0 ./ sqrt.(mean_square .+ l.epsilon)
-    
+
+    # Step 2: Calculate the scaling factor, casting epsilon to the input type
+    epsilon_casted = T(l.epsilon)
+    scale_factor = T(1.0) ./ sqrt.(mean_square .+ epsilon_casted)
+
     # Step 3: Apply the normalization by multiplying the input by the scale factor
     y = x .* scale_factor
-    
+
     # Step 4: Apply the learnable scale parameter if affine=true
     if _affine(l)
         # Get the scale parameter
-        scale_param = ps isa NamedTuple ? ps.scale : ps
-        
-        # Print debug information
-        println("Input shape: ", size(x))
-        println("Scale param shape: ", size(scale_param))
-        println("l.shape: ", l.shape)
-        println("l.dims: ", l.dims)
-        
-        # For a specific case where shape=(C,) and dims=(3,)
-        # We need to reshape scale_param to have 1s in all dims except dim 3
-        if length(l.shape) == 1 && l.dims == (3,)
-            # Special case for normalizing along channel dimension
-            # Reshape to [1, 1, C, 1] for a 4D input
-            if ndims(x) == 4
-                reshaped_scale = reshape(scale_param, (1, 1, l.shape[1], 1))
-                println("Reshaped scale to: ", size(reshaped_scale))
-                y = y .* reshaped_scale
-            else
-                # Handle other dimensionalities
-                println("Unsupported input dimensionality: ", ndims(x))
-            end
+        scale_param = ps.scale # Assume ps is NamedTuple with :scale
+
+        # Ensure scale_param has the correct number of dimensions corresponding to l.shape
+        local scale_param_squeezed
+        if ndims(scale_param) > length(l.shape) && size(scale_param)[end] == 1 && length(l.shape) > 0 # Avoid squeezing if shape is ()
+             scale_param_squeezed = dropdims(scale_param; dims=ndims(scale_param))
         else
-            # More general approach for other cases
-            # Create a reshape pattern with ones except at the dimensions we want to scale
-            reshape_pattern = ones(Int, ndims(x))
-            
-            # If dims is Colon(), we need to handle it differently
-            if l.dims isa Colon
-                # In this case, shape should match the non-batch dimensions
-                for i in 1:length(l.shape)
-                    reshape_pattern[i] = l.shape[i]
-                end
-            else
-                # For specific dims, place the shape values at those dimensions
-                for (i, dim) in enumerate(l.dims)
-                    if i <= length(l.shape)
-                        reshape_pattern[dim] = l.shape[i]
-                    end
-                end
-            end
-            
-            println("Reshape pattern: ", reshape_pattern)
-            reshaped_scale = reshape(scale_param, Tuple(reshape_pattern))
-            println("Reshaped scale to: ", size(reshaped_scale))
-            
-            # Apply the scale
-            y = y .* reshaped_scale
+             scale_param_squeezed = scale_param
         end
+         # Handle the case where l.shape is empty () which can happen if scale is just a scalar?
+         expected_shape = isempty(l.shape) ? () : l.shape
+         if size(scale_param_squeezed) != expected_shape
+              error("RMSNorm scale parameter size $(size(scale_param_squeezed)) does not match expected shape $(expected_shape)")
+         end
+
+
+        # Determine target shape for broadcasting
+        # Target shape should have size 1 in all dimensions EXCEPT those specified by l.shape
+        # The dimensions specified in l.shape must correspond to the dimensions NOT listed in l.dims
+        reshape_target = ones(Int, ndims(x))
+
+        # Handle the common CNN case: shape = (C,), dims = (ChannelDim,)
+        if length(l.shape) == 1 && l.dims isa NTuple{1, Int}
+             channel_dim = l.dims[1]
+             if ndims(x) >= channel_dim
+                 reshape_target[channel_dim] = l.shape[1] # Set the channel dimension size
+             else
+                 error("Input dimensions ($(ndims(x))) less than specified normalization dimension ($(channel_dim))")
+             end
+        else
+            # Fallback/General logic (potentially needs refinement for other use cases)
+             shape_idx = 1
+             dims_to_normalize = l.dims isa Colon ? (1:(ndims(x) - 1)) : Int.(collect(l.dims))
+             # Iterate through all dimensions of x
+             for d in 1:ndims(x)
+                  if !(d in dims_to_normalize)
+                      # If dimension is not normalized, try to assign size from l.shape
+                      if shape_idx <= length(l.shape)
+                          reshape_target[d] = l.shape[shape_idx]
+                          shape_idx += 1
+                      else
+                          # Keep size 1 if l.shape doesn't cover this dim (e.g., batch)
+                      end
+                  end
+                  # Otherwise (dimension is normalized), keep size 1
+             end
+             # Check if all shape dimensions were used
+             if shape_idx <= length(l.shape) && !(l.dims isa Colon)
+                  @warn "RMSNorm: Mismatch between l.shape $(l.shape) and non-normalized dimensions. Broadcasting might be incorrect."
+             end
+        end
+
+
+        reshaped_scale = reshape(scale_param_squeezed, Tuple(reshape_target)...)
+
+        # Apply the scale
+        y = y .* reshaped_scale
     end
-    
+
     # Step 5: Apply the activation function and return the result
     return __apply_activation(l.activation, y), st
 end
@@ -156,112 +168,3 @@ function Base.show(io::IO, l::RMSNorm)
     print(io, ", affine=$(_affine(l)), dims=$(l.dims)")
     return print(io, ")")
 end
-
-
-#=
-# Test RMSNorm =============================================================
-x = rand(Float32, 46, 46, 4, 80);
-rng = Random.default_rng();
-rms = RMSNorm((4,), dims=(3,));
-ps, st = Lux.setup(rng, rms);
-y, st = rms(x, ps, st);
-size(y)
-
-# 1. Check the RMS of the normalized output along the normalized dimensions
-# This should be close to 1.0 if scale parameter is 1.0
-function check_rms(x, dims)
-    # Calculate RMS along the specified dimensions
-    rms_value = sqrt.(mean(abs2.(x); dims=dims))
-    # The mean of these RMS values should be close to 1.0
-    mean_rms = mean(rms_value)
-    println("Mean RMS of normalized output: ", mean_rms)
-    # Should be close to 1.0 (with some small epsilon deviation)
-    # EXPECT: ~1.0 because RMSNorm explicitly normalizes by the RMS value
-    # This is the core property of RMSNorm as defined in the paper
-    println("Close to 1.0? ", isapprox(mean_rms, 1.0, atol=1e-4))
-    return mean_rms
-end
-
-# 2. Check re-scaling invariance property
-# If we scale the input, the output should remain the same
-function check_rescaling_invariance(norm_layer, ps, st, x, scale_factor=2.0)
-    # Get output with original input
-    y1, _ = norm_layer(x, ps, st)
-    
-    # Get output with scaled input
-    scaled_x = x .* scale_factor
-    y2, _ = norm_layer(scaled_x, ps, st)
-    
-    # Check if outputs are approximately equal
-    diff = maximum(abs.(y1 .- y2))
-    println("Maximum difference after rescaling input by $(scale_factor): ", diff)
-    # EXPECT: Very small difference (close to 0) because RMSNorm should be invariant to input scaling
-    # This is a key property mentioned in the paper - the re-scaling invariance
-    # The RMS of scaled input is exactly scale_factor times the RMS of original input,
-    # so the normalization should cancel out the scaling completely
-    println("Rescaling invariant? ", isapprox(diff, 0.0, atol=1e-5))
-    return diff
-end
-
-# 3. Check that mean is NOT normalized (unlike LayerNorm)
-function check_mean_not_normalized(x, original_x, dims)
-    # Calculate mean of original input
-    original_mean = mean(original_x; dims=dims)
-    
-    # Calculate mean of normalized output
-    normalized_mean = mean(x; dims=dims)
-    
-    # The ratio of means should follow the same pattern as the normalization
-    ratio = normalized_mean ./ (original_mean .+ 1e-10)  # avoid division by zero
-    
-    # The standard deviation of this ratio should NOT be close to zero
-    # (if it were normalized, all means would be zero and ratio would be constant)
-    std_ratio = std(ratio[:])
-    println("Standard deviation of mean ratios: ", std_ratio)
-    # EXPECT: std_ratio > 0.01 because RMSNorm doesn't center the data
-    # This is a key difference from LayerNorm - RMSNorm only scales but doesn't shift
-    # If the means were normalized, all normalized means would be 0 and the ratio would be 0
-    # For random data, we expect some variation in the ratio, indicating means aren't normalized
-    println("Means NOT normalized? ", std_ratio > 0.01)
-    return std_ratio
-end
-
-# 4. Check that variance is normalized
-function check_variance_normalized(x, dims)
-    # Calculate variance along the specified dimensions
-    var_value = var(x; dims=dims, corrected=false)
-    
-    # The mean of these variances should be close to 1.0
-    mean_var = mean(var_value)
-    println("Mean variance of normalized output: ", mean_var)
-    # EXPECT: For random data with mean ~0.5, we expect variance ~0.25, not 1.0
-    # This is because RMSNorm normalizes by RMS, not variance
-    # For data with mean μ and variance σ², the RMS² = μ² + σ²
-    # If RMS = 1 and μ ≈ 0.5, then σ² ≈ 0.75
-    # However, for uniform random data in [0,1], the variance is 1/12 ≈ 0.083
-    # So the expected normalized variance depends on the input distribution
-    println("Variance normalized? ", isapprox(mean_var, 1.0, atol=0.1))
-    return mean_var
-end
-
-# Run all tests
-println("\n=== Testing RMSNorm ===")
-rms_value = check_rms(y, (1, 2, 3))
-rescale_diff = check_rescaling_invariance(rms, ps, st, x)
-mean_std = check_mean_not_normalized(y, x, (1, 2, 3))
-var_mean = check_variance_normalized(y, (1, 2, 3))
-
-# 5. Bonus: Test with different scale values
-# Create a RMSNorm with custom scale initialization
-custom_init_scale(rng, dims...) = fill(0.5f0, dims...)
-rms_custom = RMSNorm((46, 46, 4), dims=(1, 2, 3), init_scale=custom_init_scale);
-ps_custom, st_custom = Lux.setup(rng, rms_custom);
-y_custom, _ = rms_custom(x, ps_custom, st_custom);
-
-println("\n=== Testing RMSNorm with custom scale (0.5) ===")
-rms_value_custom = check_rms(y_custom, (1, 2, 3))
-# EXPECT: ~0.5 because we've set the scale parameter to 0.5
-# The scale parameter directly multiplies the normalized values,
-# so the RMS of the output should be scaled by the same factor
-println("RMS with scale=0.5 should be ~0.5: ", isapprox(rms_value_custom, 0.5, atol=0.05))
-=#
