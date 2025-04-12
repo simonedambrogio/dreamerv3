@@ -1,22 +1,28 @@
-using Lux, NNlib, Random, Tools, BFloat16s, YAML, Statistics
-# include("../embodied/lux/RMSNorm.jl");
+using Lux, NNlib, Random, Tools, BFloat16s, YAML, Statistics, LuxCore
 include("../embodied/lux/rms.jl");
 include("../embodied/lux/nets.jl");
 include("../embodied/lux/BlockLinear.jl");
 include("../embodied/lux/ReArrange.jl");
+include("../embodied/lux/UpSample.jl");
 config = YAML.load_file("dreamerv3/configs.yaml");
 
-struct Decoder
+struct Decoder{SD, SS, DC} <: Lux.AbstractLuxContainerLayer{(:spatialize_deter, :spatialize_stoch, :deconvolve)}
     act::Function
     mults::Tuple
     depth::Int
     kernel::Int
-    net::Chain
     obs::Space
     depths::Tuple
-    shape::Vector{Integer}
-    bspace
+    shape::Vector{Int}
+    bspace::Int
     deter_dim::Int
+    stoch_vars::Int
+    classes_per_vars::Int
+    units::Int
+    # Network components (Lux layers)
+    spatialize_deter::SD
+    spatialize_stoch::SS
+    deconvolve::DC
 end
 
 
@@ -33,7 +39,7 @@ function Decoder(;
     bspace::Integer = 8)
 
     depths = [depth * m for m in mults];
-    # Workout the final spatial dimensions after all CNN layers: 
+    # Workout the final spatial dimensions after all CNN layers:
     # 1. Calculate the total downsampling factor
     # Example: if self.depths = [64, 128, 256, 512] and self.outer=False
     # factor = 2^4 = 16 (image will be downsampled by 16)
@@ -50,12 +56,12 @@ function Decoder(;
 
     u, g = prod(shape), bspace;
     w, h, c = shape;
-    
+
     # construct the network ---------------------------------------------------
 
     # 1. Spatialize the latent vector (width, height, channels) to feed into the CNN ---
-    # it bridges the gap between the flat state representation (from the RSSM) and 
-    # the spatial structure needed for image generation through the decoder's 
+    # it bridges the gap between the flat state representation (from the RSSM) and
+    # the spatial structure needed for image generation through the decoder's
     # convolutional layers.
     # This is going to be applied to the deter part of the state
     spatialize_deter = Chain(
@@ -65,152 +71,138 @@ function Decoder(;
         # where u = prod(shape) = w*h*c         # e.g. 6*6*8 = 288
         # and g = bspace (number of blocks)     # e.g. 8 blocks
         # Blocks create sparse connections by processing input in independent groups
-        BlockLinear(deter_dim, u, g),
+        BlockLinear(deter_dim, u, g; init_weight=cast_glorot_uniform, init_bias=cast_zeros), # sp0 in python
         # ReArrange layer reshapes the output of BlockLinear to spatial dimensions:
         # Input:  (u, batch*seq)                # e.g. (288, 80)
         # Output: (w, h, c, batch*seq)         # e.g. (6, 6, 8, 80)
         ReArrange((w, h, c, :))
     );
 
-    # 2. Spatialize the stochastic variables (stoch_vars, classes_per_vars, seq_length, batch_size)
+    # 2. Spatialize the stochastic variables (stoch_vars, classes_per_vars, seq_length, batch_size) ---
     # to feed into the CNN
     # x1 dimension: (stoch_vars x classes_per_vars, seq_length x batch_size)
     # This is going to be applied to the stoch part of the state
     spatialize_stoch = Chain(
         # Dense layer transforms the stochastic variables into spatial features:
-        Dense(stoch_vars * classes_per_vars, 2units, act), # Output: (2*units, batch*seq) # sp1
+        # Input: (stoch_vars * classes_per_vars, batch*seq) # e.g. (8, 80)
+        # Output: (2*units, batch*seq)                     # e.g. (16, 80)
+        Dense(stoch_vars * classes_per_vars => 2units, act; init_weight=cast_glorot_uniform, init_bias=cast_zeros), # sp1 in python
         # Normalize along feature dim (dim 1), includes activation
-        RMSNorm((2 * units,), act; dims=(1,), init_scale=cast_ones), # sp1norm
-        # Dense layer transforms the stochastic variables into spatial features:
-        Dense(2units, prod(shape), act), ReArrange((w, h, c, :)) # sp2
+        # Input/Output: (2*units, batch*seq)               # e.g. (16, 80)
+        RMSNorm((2units,), act; dims=(1,), init_scale=cast_ones), # sp1norm in python
+        # Dense layer transforms intermediate features into spatial features matching deter:
+        # Input: (2*units, batch*seq)                      # e.g. (16, 80)
+        # Output: (u, batch*seq)                           # e.g. (288, 80)
+        Dense(2units => u; init_weight=cast_glorot_uniform, init_bias=cast_zeros), # sp2 in python (without act, handled by ReArrange below)
+        # ReArrange layer reshapes the output to spatial dimensions:
+        # Input:  (u, batch*seq)                           # e.g. (288, 80)
+        # Output: (w, h, c, batch*seq)                    # e.g. (6, 6, 8, 80)
+        ReArrange((w, h, c, :))
     );
-    
-   
-    # Test BlockLinear --------------------------------------------------------
-    bl = BlockLinear(deter_dim, u, g)
-    ps, st = Lux.setup(rng, bl);
-    x = rand32(deter_dim, seq_length * batch_size);
-    y, st = bl(x, ps, st);
-    size(y)
 
-    # Test ReArrange -----------------------------------------------------------
-    r = ReArrange((w, h, c, :))
-    ps, st = Lux.setup(rng, r);
-    y, st = r(y, ps, st);
-    size(y)
-    
+    # 3. Deconvolve the spatialized deter and stoch parts ---
+    deconv_layers_list = []
+    # Input:  (w, h, c, batch*seq) after element-wise addition # e.g. (6, 6, 8, 80)
+    # Output: (w, h, c, batch*seq)                             # e.g. (6, 6, 8, 80)
+    # Normalizes across channel dimension (dim=3), includes activation
+    push!(deconv_layers_list, RMSNorm((c,), act; dims=(3,), init_scale=cast_ones)); # spnorm in python
 
-    # Test Linear -------------------------------------------------------------
-    l = Dense(stoch_vars * classes_per_vars, 2units, act)
-    ps, st = Lux.setup(rng, l);
-    x = rand32(stoch_vars * classes_per_vars, seq_length * batch_size);
-    y, st = l(x, ps, st);
-    size(y)
+    # Define the main convolutional upsampling layers
+    current_channels = c # Channels after combine step (e.g. 8)
+    # Iterate from second-to-last depth down to the first depth
+    # Python: for i, depth in reversed(list(enumerate(self.depths[:-1])))
+    # Example depths = [4, 6, 8, 8]. Loop iterates over [8, 6, 4] (indices 2, 1, 0)
+    # Julia depths = [4, 6, 8, 8]. reverse(depths[1:end-1]) gives [8, 6, 4]
+    for depth_out in reverse(depths[1:end-1])
+        # Upsample spatial dimensions (W, H) by 2x using nearest neighbor
+        # Input: (Wi, Hi, current_channels, batch*seq)   # e.g. iter 1: (6, 6, 8, 80)
+        # Output: (2*Wi, 2*Hi, current_channels, batch*seq) # e.g. iter 1: (12, 12, 8, 80)
+        push!(deconv_layers_list, UpSample(factor=2, dims=(1, 2))) # Equivalent to Python's repeat(2,-2).repeat(2,-3)
 
-    # Test RMSNorm -------------------------------------------------------------
-    rn = RMSNorm((2units,), act; dims = (1,), init_scale=cast_ones)
-    ps, st = Lux.setup(rng, rn);
-    y, st = rn(y, ps, st);
-    size(y)
+        # Apply 2D Convolution
+        # Input: (2*Wi, 2*Hi, current_channels, batch*seq) # e.g. iter 1: (12, 12, 8, 80)
+        # Output: (2*Wi, 2*Hi, depth_out, batch*seq)       # e.g. iter 1: (12, 12, 8, 80)
+        push!(deconv_layers_list, Conv((kernel, kernel), current_channels => depth_out; pad=SamePad(), init_weight=cast_glorot_uniform, init_bias=cast_zeros))
 
-    # Test Dense + Reshape -----------------------------------------------------
-    # Implement a Dense layer that takes as input the stoch part of the state
-    # of size 16, 80 (16 = stoch_vars * classes_per_vars, 80 = T * B) and outputs a vector of size 
-    # shape (where shape is defined above, and for instance is (6, 6, 8)). So the input
-    # goes from 16 to 6, 6, 8 so the final output dimention is 6, 6, 8, 80 (a 4 dimentional array)
-    x = rand32(16, 80);
-    l = Chain(Dense(16 => u, act), ReArrange((w, h, c, :)))
-    ps, st = Lux.setup(rng, l);
-    y, st = l(x, ps, st);
-    size(y)
+        # Apply RMS Normalization and activation
+        # Input/Output: (2*Wi, 2*Hi, depth_out, batch*seq) # e.g. iter 1: (12, 12, 8, 80)
+        # Normalizes across channel dimension (dim=3), includes activation
+        push!(deconv_layers_list, RMSNorm((depth_out,), act; dims=(3,), init_scale=cast_ones))
 
-    
-    # layers = []
-    
-    # l = Chain(
-    #     BlockLinear(deter_dim, u, g),
-    #     ReArrange((w, h, c, :))
-    # )
-    # ps, st = Lux.setup(rng, l)
-    # x = rand32(deter_dim, seq_length * batch_size)
-    # y, st = l(x, ps, st)
-    # size(y)
+        current_channels = depth_out # Update channels for next iteration input (e.g. iter 1: 8)
+    end
 
-    # channels = obs.size[3]
-    # for (d_in, d_out) in zip(vcat(channels,depths[1:end-1]), depths)
-    #     push!(layers, Conv((kernel, kernel), d_in => d_out, pad=SamePad()))  # Add padding
-    #     push!(layers, MaxPool((2, 2), stride=(2, 2)))
-    #     push!(layers, RMSNorm(d_out, act))
-    # end
-    # nn = Chain(layers...)
+    # Map to image channels
+    imgdep = obs.size[3] # Target image channels (e.g., 1)
+    # Final Upsample
+    # Input: (W_last, H_last, depth_in_final, batch*seq)     # e.g. (48, 48, 4, 80)
+    # Output: (2*W_last, 2*H_last, depth_in_final, batch*seq) # e.g. (96, 96, 4, 80)
+    push!(deconv_layers_list, UpSample(factor=2, dims=(1, 2))) # Final repeat(2,-2).repeat(2,-3)
+    # Final Convolution
+    # Input: (96, 96, depth_in_final, batch*seq)             # e.g. (96, 96, 4, 80)
+    # Output: (96, 96, imgdep, batch*seq)                   # e.g. (96, 96, 1, 80)
+    push!(deconv_layers_list, Conv((kernel, kernel), current_channels => imgdep; pad=SamePad(), init_weight=cast_glorot_uniform, init_bias=cast_zeros))
 
-    # return the encoder ------------------------------------------------------
-    return Decoder(act, mults, depth, kernel, nn, obs, Tuple(depths), shape, bspace, deter_dim)
+    # Sigmoid activation is applied *after* this layer in the call function
+    # push!(deconv_layers_list, sigmoid)
+
+    # Final ReArrange layer
+    # Input: (96, 96, imgdep, batch*seq)                   # e.g. (96, 96, 1, 80)
+    # Output: (96, 96, batch*seq, imgdep)                   # e.g. (96, 96, 80, 1)
+    # push!(deconv_layers_list, ReArrange((obs.size..., T, B)))
+
+    deconv_layers = Chain(deconv_layers_list...)
+
+    # return the decoder struct ------------------------------------------------------
+    return Decoder(act, mults, depth, kernel, obs, Tuple(depths), shape, bspace, deter_dim, stoch_vars, classes_per_vars, units, spatialize_deter, spatialize_stoch, deconv_layers)
 end
-
-B = batch_size = config["debug"]["batch_size"];
-T = seq_length = config["debug"]["batch_length"];
-deter_dim = config["debug"]["agent"][".*\\.deter"];
-obs = Tools.Space(UInt8, (96, 96, 1));
-depth = config["debug"]["agent"][".*\\.depth"];
-units = config["debug"]["agent"][".*\\.units"];
-stoch_vars = config["debug"]["agent"][".*\\.stoch"];
-classes_per_vars = config["debug"]["agent"][".*\\.classes"];
-
-act=gelu
-mults=(2, 3, 4, 4)
-kernel=5
-bspace=8
-
-rng = Random.default_rng();
-dec = Decoder(; obs, deter_dim, depth, units, stoch_vars, classes_per_vars);
-
-
-feat = Dict(
-    "deter" => cast(rand(rng, Float32, deter_dim, seq_length, batch_size)),
-    "stoch" => cast(rand(rng, Float32, stoch_vars, classes_per_vars, seq_length, batch_size)),
-);
-reset = rand(rng, Bool, seq_length, batch_size);
 
 
 """
 Decoder for RSSM
 """
-function (dec::Decoder)(state, ps, feat, reset)
-    
-    bshape = size(reset); # sequence length, batch size
-    u, g = prod(dec.shape), dec.bspace;
-    deter, stoch = feat["deter"], feat["stoch"];
-    # x0 (deter): (8, 10, 8)        # deter_dim, length, batch
-    # x1 (stoch): (2, 4, 10, 8)     # stoch_vars, classes, length, batch
-    stoch = reshape(stoch, (:, size(stoch)[end-1:end]...)); # (2, 4, 10, 8) -> (8, 10, 8) 
-    stoch = reshape(stoch, (size(stoch, 1), :)); # (8, 10, 8) -> (8, 80)
-    deter = reshape(deter, (size(deter, 1), :)); # (8, 10, 8) -> (8, 80)
-    x = vcat(stoch, deter); # (16, 80)
+function (dec::Decoder)(feat, ps, st)
 
-    
-    # 4. Calculate the final spatial dimensions after all CNN layers
+    # Get runtime dimensions T, B from input 'feat'
+    # Assuming feat["deter"] has shape (deter_dim, T, B)
+    _, T, B = size(feat["deter"])
 
-    # inp = [cast(feat[k]) for k in ("stoch", "deter")]; 
-    # inp = [reshape(x, (:, prod(bshape))) for x in inp]; # flatten the sequence and batch dimensions
-    # inp = vcat(inp...); # n features x (seq_length * batch_size)
+    # Prepare inputs: Flatten sequence and batch dimensions
+    deter_flat = reshape(feat["deter"], (dec.deter_dim, :));
+    stoch_flat = reshape(feat["stoch"], (dec.stoch_vars * dec.classes_per_vars, :));
 
-    # flatten the sequence and batch dimensions
-    W, H, C, T, B = size(imgs);
-    imgs = reshape(imgs, (W, H, C, T*B));
-    @assert typeof(imgs) == Array{UInt8, 4} "Image must be an array of UInt8"
-    imgs = Float32.(imgs) ./ 255f0 .- 0.5f0;
-    
-    output, new_state = enc.net(imgs, ps, state);
+    # 1. Spatialize the deter and stoch parts
+    # Pass the corresponding subset of parameters and states
+    out_deter, st_deter_new = dec.spatialize_deter(deter_flat, ps.spatialize_deter, st.spatialize_deter)
+    out_stoch, st_stoch_new = dec.spatialize_stoch(stoch_flat, ps.spatialize_stoch, st.spatialize_stoch)
 
-    # Reshape the output to be a 3D array of size (embedding_dim, T, B)
-    W, H, C, A = size(output);
-    WHC = W*H*C
-    output = reshape(output, (WHC, A));
-    output = reshape(output, (WHC, T, B))
+    # 2. Combine spatialized features
+    input_decoder = out_deter + out_stoch;
 
-    return output, new_state
+    # 3. Deconvolve the combined input
+    out_deconv, st_deconv_new = dec.deconvolve(input_decoder, ps.deconvolve, st.deconvolve)
+
+    # 4. Apply final activation (sigmoid)
+    out_sigmoid = sigmoid.(out_deconv)
+
+    # 5. Reshape the output to include T and B dimensions
+    # Target shape: (Width, Height, Channels, Time, Batch)
+    output = reshape(out_sigmoid, (dec.obs.size..., T, B))
+
+    # 6. Combine updated states into a new nested NamedTuple
+    st_new = (
+        spatialize_deter=st_deter_new,
+        spatialize_stoch=st_stoch_new,
+        deconvolve=st_deconv_new
+    )
+
+    return output, st_new
 end;
+
+
+
+
+
 
 # # Usage example with debug parameters:
 # obs = Dict(
@@ -227,4 +219,3 @@ end;
 # obs = (image = rand(UInt8, 96, 96, 1, seq_length, batch_size),);
 # output, new_st = forward(enc, st, ps, obs);
 # size(output)
-

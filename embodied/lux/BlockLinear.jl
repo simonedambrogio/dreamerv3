@@ -52,7 +52,10 @@ function Lux.initialparameters(rng::AbstractRNG, l::BlockLinear)
     
     # Weight shape: (blocks, in_per_block, out_per_block)
     weight_shape = (l.blocks, block_in_size, block_out_size)
-    weight = l.init_weight(rng, weight_shape...) .* l.outscale
+    
+    # Ensure multiplication happens in the compute type
+    compute_T = isdefined(@__MODULE__, :COMPUTE_TYPE) ? COMPUTE_TYPE : Float32 # Get compute type safely
+    weight = l.init_weight(rng, weight_shape...) .* compute_T(l.outscale)
     
     if l.bias
         bias = l.init_bias(rng, l.units)

@@ -185,8 +185,8 @@ println(enc_kwargs)
         dummy_obs = (; image = dummy_image) # Use NamedTuple matching encoder input
 
         # Run forward pass
-        # Note: The Encoder forward pass takes (state, params, obs)
-        output, st_new = enc(st, ps, dummy_obs)
+        # Note: The Encoder forward pass takes (obs, params, state)
+        output, st_new = enc(dummy_obs, ps, st)
 
         # Calculate expected output dimensions
         final_depth = enc_kwargs.depth * enc_kwargs.mults[end]
