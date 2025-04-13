@@ -1,15 +1,13 @@
-using Lux, NNlib, Random, Tools
-# include("../embodied/lux/RMSNorm-old.jl");
-# include("../embodied/lux/RMSNorm.jl");
+using Lux, NNlib, Random, Tools, LuxCore
 include("../embodied/lux/rms.jl");
 include("../embodied/lux/nets.jl");
 
-struct Encoder
+struct Encoder{T} <: Lux.AbstractLuxContainerLayer{(:convolve,)}
     act::Function
     mults::Tuple
     depth::Int
     kernel::Int
-    net::Chain
+    convolve::T
 end
 
 function Encoder(;
@@ -33,7 +31,7 @@ function Encoder(;
     nn = Chain(layers...)
 
     # return the encoder ------------------------------------------------------
-    return Encoder(act, mults, depth, kernel, nn)
+    return Encoder{typeof(nn)}(act, mults, depth, kernel, nn)
 end
 
 """
@@ -133,11 +131,10 @@ function (enc::Encoder)(obs, ps, st)
     @assert typeof(imgs) == Array{UInt8, 4} "Image must be an array of UInt8"
     imgs = cast.(imgs) ./ cast(255) .- cast(0.5);
     
-    output, new_state = enc.net(imgs, ps, st);
+    output, new_state = enc.convolve(imgs, ps.convolve, st.convolve);
 
     # Reshape the output to be a 3D array of size (embedding_dim, T, B)
     W, H, C, A = size(output);
-    println("W, H, C, A: $W, $H, $C, $A")
     WHC = W*H*C
     output = reshape(output, (WHC, A));
     output = reshape(output, (WHC, T, B))

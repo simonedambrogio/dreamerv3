@@ -173,7 +173,7 @@ println(enc_kwargs)
         println(ANSI_GREEN, "\n--- Testing Encoder Forward Pass ---", ANSI_RESET)
         # Instantiate Encoder and setup Lux
         enc = Encoder(; enc_kwargs...)
-        ps, st = Lux.setup(rng, enc.net)
+        ps, st = Lux.setup(rng, enc)
 
         # Define batch and sequence length
         T = 10 # Sequence Length

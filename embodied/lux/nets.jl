@@ -11,7 +11,7 @@ function cast(x::Number)
     end
 end
 
-function cast(x::Array)
+function cast(x::AbstractArray)
     return COMPUTE_TYPE.(x)
 end
 

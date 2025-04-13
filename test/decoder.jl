@@ -18,8 +18,8 @@ deter_dim = config["debug"]["agent"][".*\\.deter"];
 obs = Tools.Space(UInt8, (96, 96, 1));
 depth = config["debug"]["agent"][".*\\.depth"];
 units = config["debug"]["agent"][".*\\.units"];
-stoch_vars = config["debug"]["agent"][".*\\.stoch"];
-classes_per_vars = config["debug"]["agent"][".*\\.classes"];
+stoch_dim = config["debug"]["agent"][".*\\.stoch"];
+classes_dim = config["debug"]["agent"][".*\\.classes"];
 
 act=gelu;
 mults=(2, 3, 4, 4);
@@ -30,7 +30,7 @@ rng = Random.default_rng();
 
 feat = Dict(
     "deter" => cast(rand(rng, Float32, deter_dim, seq_length, batch_size)),
-    "stoch" => cast(rand(rng, Float32, stoch_vars, classes_per_vars, seq_length, batch_size)),
+    "stoch" => cast(rand(rng, Float32, stoch_dim, classes_dim, seq_length, batch_size)),
 );
 reset = rand(rng, Bool, seq_length, batch_size);
 
@@ -38,7 +38,7 @@ reset = rand(rng, Bool, seq_length, batch_size);
 # Test Forward Pass ------------------------------------------------------------
 @testset "Forward Pass" begin
     println(ANSI_GREEN, "\n----- Testing Forward Pass... -----", ANSI_RESET)
-    dec = Decoder(; obs, deter_dim, units, stoch_vars, classes_per_vars, mults, depth, kernel, bspace);
+    dec = Decoder(; obs, deter_dim, units, stoch_dim, classes_dim, mults, depth, kernel, bspace);
     ps, state = Lux.setup(rng, dec);
     out, state_new = dec(feat, ps, state);
     @testset "Output Type" begin
@@ -72,7 +72,7 @@ w, h, c = shape;
 println(ANSI_GREEN, "\n----- Input shape -----", ANSI_RESET)
 println("Width: ", w, "\nHeight: ", h, "\nChannels: ", c)
 println("Deterministic part shape: ", deter_dim)
-println("Stochastic part shape: ", stoch_vars, " x ", classes_per_vars)
+println("Stochastic part shape: ", stoch_dim, " x ", classes_dim)
 println("Sequence length: ", T, "\nBatch size: ", B)
 
 println(ANSI_GREEN, "\n----- Summary of the Steps -----", ANSI_RESET)
@@ -138,9 +138,9 @@ println(ANSI_RESET) # End color
 println(ANSI_GREEN, "\n----- 2. Spatialize the Stochastic part -----", ANSI_RESET)
 
 # Test Linear -------------------------------------------------------------
-l = Dense(stoch_vars * classes_per_vars, 2units, act)
+l = Dense(stoch_dim * classes_dim, 2units, act)
 ps, st = Lux.setup(rng, l);
-x = rand32(stoch_vars * classes_per_vars, seq_length * batch_size);
+x = rand32(stoch_dim * classes_dim, seq_length * batch_size);
 out_l, st = l(x, ps, st);
 size(out_l)
 
@@ -150,7 +150,7 @@ println("  - Goal: Perform a standard linear transformation (fully connected).")
 println("  - Mechanism: Multiplies input features by a weight matrix and adds a bias.")
 println("               Every input feature connects to every output feature.")
 println("  - Purpose here: Project the flattened stochastic state features")
-println("                  (", stoch_vars * classes_per_vars, ") into an intermediate representation of size (", 2 * units, ").")
+println("                  (", stoch_dim * classes_dim, ") into an intermediate representation of size (", 2 * units, ").")
 println("  - Input Shape: ", size(x))
 println("  - Output Shape: ", size(out_l))
 print(ANSI_RESET) # End color

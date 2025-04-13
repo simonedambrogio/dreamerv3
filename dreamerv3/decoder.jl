@@ -16,8 +16,8 @@ struct Decoder{SD, SS, DC} <: Lux.AbstractLuxContainerLayer{(:spatialize_deter, 
     shape::Vector{Int}
     bspace::Int
     deter_dim::Int
-    stoch_vars::Int
-    classes_per_vars::Int
+    stoch_dim::Int
+    classes_dim::Int
     units::Int
     # Network components (Lux layers)
     spatialize_deter::SD
@@ -30,8 +30,8 @@ function Decoder(;
     obs::Space,
     deter_dim::Int,
     units::Int,
-    stoch_vars::Int,
-    classes_per_vars::Int,
+    stoch_dim::Int,
+    classes_dim::Int,
     act::Function=gelu,
     mults::Tuple=(2, 3, 4, 4),
     depth::Int=64,
@@ -78,15 +78,15 @@ function Decoder(;
         ReArrange((w, h, c, :))
     );
 
-    # 2. Spatialize the stochastic variables (stoch_vars, classes_per_vars, seq_length, batch_size) ---
+    # 2. Spatialize the stochastic variables (stoch_dim, classes_dim, seq_length, batch_size) ---
     # to feed into the CNN
-    # x1 dimension: (stoch_vars x classes_per_vars, seq_length x batch_size)
+    # x1 dimension: (stoch_dim x classes_dim, seq_length x batch_size)
     # This is going to be applied to the stoch part of the state
     spatialize_stoch = Chain(
         # Dense layer transforms the stochastic variables into spatial features:
-        # Input: (stoch_vars * classes_per_vars, batch*seq) # e.g. (8, 80)
+        # Input: (stoch_dim * classes_dim, batch*seq) # e.g. (8, 80)
         # Output: (2*units, batch*seq)                     # e.g. (16, 80)
-        Dense(stoch_vars * classes_per_vars => 2units, act; init_weight=cast_glorot_uniform, init_bias=cast_zeros), # sp1 in python
+        Dense(stoch_dim * classes_dim => 2units, act; init_weight=cast_glorot_uniform, init_bias=cast_zeros), # sp1 in python
         # Normalize along feature dim (dim 1), includes activation
         # Input/Output: (2*units, batch*seq)               # e.g. (16, 80)
         RMSNorm((2units,), act; dims=(1,), init_scale=cast_ones), # sp1norm in python
@@ -154,7 +154,7 @@ function Decoder(;
     deconv_layers = Chain(deconv_layers_list...)
 
     # return the decoder struct ------------------------------------------------------
-    return Decoder(act, mults, depth, kernel, obs, Tuple(depths), shape, bspace, deter_dim, stoch_vars, classes_per_vars, units, spatialize_deter, spatialize_stoch, deconv_layers)
+    return Decoder(act, mults, depth, kernel, obs, Tuple(depths), shape, bspace, deter_dim, stoch_dim, classes_dim, units, spatialize_deter, spatialize_stoch, deconv_layers)
 end
 
 
@@ -169,7 +169,7 @@ function (dec::Decoder)(feat, ps, st)
 
     # Prepare inputs: Flatten sequence and batch dimensions
     deter_flat = reshape(feat["deter"], (dec.deter_dim, :));
-    stoch_flat = reshape(feat["stoch"], (dec.stoch_vars * dec.classes_per_vars, :));
+    stoch_flat = reshape(feat["stoch"], (dec.stoch_dim * dec.classes_dim, :));
 
     # 1. Spatialize the deter and stoch parts
     # Pass the corresponding subset of parameters and states
