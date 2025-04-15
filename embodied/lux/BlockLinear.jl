@@ -50,8 +50,9 @@ function Lux.initialparameters(rng::AbstractRNG, l::BlockLinear)
     block_in_size = l.in_features ÷ l.blocks
     block_out_size = l.units ÷ l.blocks
     
-    # Weight shape: (blocks, in_per_block, out_per_block)
-    weight_shape = (l.blocks, block_in_size, block_out_size)
+    # Weight shape: (out_per_block, in_per_block, blocks)
+    # This shape is directly usable by batched_mul after permuting the input x
+    weight_shape = (block_out_size, block_in_size, l.blocks)
     
     # Ensure multiplication happens in the compute type
     compute_T = isdefined(@__MODULE__, :COMPUTE_TYPE) ? COMPUTE_TYPE : Float32 # Get compute type safely
@@ -81,11 +82,8 @@ function (l::BlockLinear)(x::AbstractArray, ps, st::NamedTuple)
     # - Batch dimension last
     x_batched = permutedims(x_blocked, (1, 3, 2))  # (in_per_block, batch, blocks)
     
-    # Weight should be (out_per_block, in_per_block, blocks)
-    weight = permutedims(ps.weight, (3, 2, 1))
-    
     # Perform the block-wise multiplication
-    y = batched_mul(weight, x_batched)
+    y = batched_mul(ps.weight, x_batched) # Use ps.weight directly
     
     # Reshape output to (features, batch...)
     y = permutedims(y, (1, 3, 2))  # (out_features, blocks, batch)

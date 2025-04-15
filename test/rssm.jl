@@ -85,15 +85,16 @@ println(ANSI_BLUE, "\t Compute Core RSSM", ANSI_RESET)
 
 g = rssm.blocks # Get number of blocks from rssm instance
 
-
+first_space = 40
+second_space = 70
 text = "\t    - Reshape stoch"
 print(ANSI_VIOLET, text, ANSI_RESET)
 size_input = size(stoch)
 stoch = reshape(stoch, (:, size(stoch,3)))  # stoch x classes x B -> (stoch * classes, B) # e.g. 2, 4, 8 -> (8, 8) 
 size_output = size(stoch)
-padded_size_str = "$(" "^(35 - length(text) )) $size_input -> $size_output"
+padded_size_str = "$(" "^(first_space - length(text) )) $size_input -> $size_output"
 print(ANSI_VIOLET, padded_size_str, ANSI_RESET)
-println(ANSI_VIOLET, " "^(70 - (length(text) + length(padded_size_str))), "stoch_dim, classes_dim, B -> stoch_dim*classes_dim, B", ANSI_RESET, "\n")
+println(ANSI_VIOLET, " "^(second_space - (length(text) + length(padded_size_str))), "stoch_dim, classes_dim, B -> stoch_dim*classes_dim, B", ANSI_RESET, "\n")
 
 text = "\t    - Norm(Dense(deter), act)"
 print(ANSI_VIOLET, text, ANSI_RESET)
@@ -105,9 +106,9 @@ ps, st = Lux.setup(rng, l);
 size_input = size(deter)
 x0, st = l(deter, ps, st);
 size_output = size(x0)
-padded_size_str = "$(" "^(35 - length(text) )) $size_input -> $size_output"
+padded_size_str = "$(" "^(first_space - length(text) )) $size_input -> $size_output"
 print(ANSI_VIOLET, padded_size_str, ANSI_RESET)
-println(ANSI_VIOLET, " "^(70 - (length(text) + length(padded_size_str))), "deter_dim, B -> hidden_dim, B", ANSI_RESET)
+println(ANSI_VIOLET, " "^(second_space - (length(text) + length(padded_size_str))), "deter_dim, B -> hidden_dim, B", ANSI_RESET)
 
 
 text = "\t    - Norm(Dense(stoch), act)"
@@ -120,9 +121,9 @@ ps, st = Lux.setup(rng, l);
 size_input = size(stoch)
 x1, st = l(stoch, ps, st);
 size_output = size(x1)
-padded_size_str = "$(" "^(35 - length(text) )) $size_input -> $size_output"
+padded_size_str = "$(" "^(first_space - length(text) )) $size_input -> $size_output"
 print(ANSI_VIOLET, padded_size_str, ANSI_RESET)
-println(ANSI_VIOLET, " "^(70 - (length(text) + length(padded_size_str))), "stoch_dim*classes_dim, B -> hidden_dim, B", ANSI_RESET)
+println(ANSI_VIOLET, " "^(second_space - (length(text) + length(padded_size_str))), "stoch_dim*classes_dim, B -> hidden_dim, B", ANSI_RESET)
 
 
 text = "\t    - Norm(Dense(action), act)"
@@ -135,9 +136,9 @@ ps, st = Lux.setup(rng, l);
 size_input = size(action)
 x2, st = l(action, ps, st);
 size_output = size(x2)
-padded_size_str = "$(" "^(35 - length(text) )) $size_input -> $size_output"
+padded_size_str = "$(" "^(first_space - length(text) )) $size_input -> $size_output"
 print(ANSI_VIOLET, padded_size_str, ANSI_RESET)
-println(ANSI_VIOLET, " "^(70 - (length(text) + length(padded_size_str))), "num_actions, B -> hidden_dim, B", ANSI_RESET)
+println(ANSI_VIOLET, " "^(second_space - (length(text) + length(padded_size_str))), "num_actions, B -> hidden_dim, B", ANSI_RESET)
 
 println(ANSI_RESET)
 
@@ -156,7 +157,7 @@ size_output = size(reshaped_xc)
 padded_size_str = "$(" "^(110 - length(text) )) $(size_output)"
 println(ANSI_VIOLET, padded_size_str, ANSI_RESET)
 
-text = "\t    - Repeat context"
+text = "\t    - Repeat context g times"
 print(ANSI_VIOLET, text, ANSI_RESET)
 repeated_xc = repeat(reshaped_xc, outer=(1, g, 1))
 size_output = size(repeated_xc)
@@ -178,12 +179,99 @@ x = group2flat(vcat(grouped_deter, repeated_xc))
 size_output = size(x)
 padded_size_str = "$(" "^(110 - length(text) )) $(size_output)"
 println(ANSI_VIOLET, padded_size_str, ANSI_RESET)
-
 println(ANSI_RESET)
 
 
-# The variable 'repeated_xc' now holds the result equivalent to the Python line
-# x = jnp.concatenate([x0, x1, x2], -1)[..., None, :].repeat(g, -2)
-# but with Julia's (Features, Blocks, Batch) dimension order.
+# x = self.sub(f'dynhid{i}', nn.BlockLinear, self.deter, g, **self.kw)(x)
+# x = nn.act(self.act)(self.sub(f'dynhid{i}norm', nn.Norm, self.norm)(x))
+text = "\t    - BlockLinear"
+print(ANSI_VIOLET, text, ANSI_RESET)
+# Static calculation of the input dimension for BlockLinear
+@assert deter_dim % g == 0 "deter_dim must be divisible by blocks (g)"
+h = deter_dim ÷ g
+feat_concat_static = 3 * hidden_dim
+input_dim_bl = (h + feat_concat_static) * g
+# input_dim_bl = size(x, 1) # Dynamic calculation (for verification)
+output_dim_bl = deter_dim
+l = BlockLinear(input_dim_bl, output_dim_bl, g; init_weight=cast_glorot_uniform, init_bias=cast_zeros)
+ps, st = Lux.setup(rng, l);
+size_input = size(x)
+x_bl, st = l(x, ps, st); # Renamed output to avoid immediate reuse of x
+size_output = size(x_bl)
+padded_size_str = "$(" "^(first_space - length(text) )) $size_input -> $size_output"
+print(ANSI_VIOLET, padded_size_str, ANSI_RESET)
+println(ANSI_VIOLET, " "^(second_space - (length(text) + length(padded_size_str))), "input_dim, B -> output_dim, B", ANSI_RESET)
 
-# Next step will be the flat2group/concatenate/group2flat part
+text = "\t    - RMSNorm + Act"
+print(ANSI_VIOLET, text, ANSI_RESET)
+l_norm = RMSNorm((deter_dim,), act; dims=(1,), init_scale=cast_ones)
+ps_norm, st_norm = Lux.setup(rng, l_norm);
+size_input = size(x_bl)
+x_norm, st_norm = l_norm(x_bl, ps_norm, st_norm);
+size_output = size(x_norm)
+padded_size_str = "$(" "^(first_space - length(text) )) $size_input -> $size_output"
+print(ANSI_VIOLET, padded_size_str, ANSI_RESET)
+println(ANSI_VIOLET, " "^(second_space - (length(text) + length(padded_size_str))), "deter_dim, B -> deter_dim, B", ANSI_RESET)
+println(ANSI_VIOLET, "\t    (repeat rmms.dynlayers times)", ANSI_RESET)
+println(ANSI_RESET)
+
+
+# x = self.sub('dyngru', nn.BlockLinear, 3 * self.deter, g, **self.kw)(x)
+text = "\t    - BlockLinear"
+print(ANSI_VIOLET, text, ANSI_RESET)
+# statcally calculate the input dimension for BlockLinear
+@assert 3 * deter_dim % g == 0 "3 * deter_dim must be divisible by blocks (g)"
+input_dim_bl1 = output_dim_bl
+output_dim_bl1 = 3 * deter_dim
+l = BlockLinear(input_dim_bl1, output_dim_bl1, g; init_weight=cast_glorot_uniform, init_bias=cast_zeros)
+ps, st = Lux.setup(rng, l);
+x_bl1, st = l(x_norm, ps, st);
+size_output = size(x_bl1)
+padded_size_str = "$(" "^(first_space - length(text) )) $size_input -> $size_output"
+print(ANSI_VIOLET, padded_size_str, ANSI_RESET)
+println(ANSI_VIOLET, " "^(second_space - (length(text) + length(padded_size_str))), "input_dim, B -> output_dim, B", ANSI_RESET)
+
+
+x_bl1_gr = flat2group(x_bl1, g)
+
+
+text = "\t    - Split gates"
+print(ANSI_VIOLET, text, ANSI_RESET)
+# Use the helper function to split along the first dimension
+gates = split(x_bl1_gr, 3, 1);
+size_output = size(gates[1])
+size_input_str = "$(size(x_bl1_gr))"
+size_output_str = "$(length(gates)) x $(size(gates[1]))" # Show number of splits
+padded_size_str = "$(" "^(first_space - length(text) )) $size_input_str -> $size_output_str"
+print(ANSI_VIOLET, padded_size_str, ANSI_RESET)
+println(ANSI_VIOLET, " "^(second_space - (length(text) + length(padded_size_str))), "(Feat/Block, Blocks, B) -> 3 x (Feat/Gate, Blocks, B)", ANSI_RESET)
+
+
+
+# reset, cand, update = [group2flat(x) for x in gates]
+reset, cand, update = [group2flat(x) for x in gates];
+text = "\t    - Flatten (reset, cand, update)"
+print(ANSI_VIOLET, text, ANSI_RESET)
+size_input_str = "$(size(gates[1]))"
+size_output_str = "$(size(cand))" # Show number of splits
+padded_size_str = "$(" "^(first_space - length(text) )) $size_input_str -> 3 x $size_output_str"
+print(ANSI_VIOLET, padded_size_str, ANSI_RESET)
+println(ANSI_VIOLET, " "^(second_space - (length(text) + length(padded_size_str))), "(Feat/Block, Blocks, B) -> 3 x (Feat/Gate, B)", ANSI_RESET)
+
+text = "\t    - reset = sigmoid(reset)"
+println(ANSI_VIOLET, text, ANSI_RESET)
+reset = sigmoid.(reset)
+
+text = "\t    - cand = tanh(reset .* cand)"
+println(ANSI_VIOLET, text, ANSI_RESET)
+cand = tanh.(reset .* cand)
+
+text = "\t    - update = sigmoid(update .- cast(1))"
+println(ANSI_VIOLET, text, ANSI_RESET)
+update = sigmoid.(update .- cast(1))
+
+text = "\t    - deter = update * cand + (cast(1) .- update) * deter"
+println(ANSI_VIOLET, text, ANSI_RESET)
+deter = update * cand + (cast(1) .- update) * deter
+
+println(ANSI_RESET)

@@ -1,0 +1,88 @@
+
+graph TD
+    subgraph Input State / Context
+        D_prev[Previous deter]
+        S[stoch]
+        A[action]
+    end
+
+    subgraph Context Processing
+        D_prev -- Processed Path --> OpD(Dense + Norm + Act) --> x0["(hidden_dim, B)"]
+        S --> OpS(Dense + Norm + Act) --> x1["(hidden_dim, B)"]
+        A --> OpA(Dense + Norm + Act) --> x2["(hidden_dim, B)"]
+
+        x0 --> Cat1("Concat [x0, x1, x2]") --> XC["(3*hidden_dim, B)"]
+        x1 --> Cat1
+        x2 --> Cat1
+
+        XC --> OpRpt("Add Dim + Repeat") --> RptXC["repeated_xc (3*h, g, B)"]
+
+        D_prev -- Direct Path --> OpF2G_D(flat2group) --> GrpD["grouped_deter (d/g, g, B)"]
+
+        GrpD --> Cat2("Concat [grouped_deter, repeated_xc]")
+        RptXC --> Cat2
+
+        Cat2 --> OpG2F(group2flat) --> X_Ctx["Input Context (ctx_feat, B)"]
+    end
+
+    subgraph Dynamic Layers Loop # Dashed border indicates repetition
+        style Dynamic Layers Loop fill:#eee,stroke:#333,stroke-width:2px,stroke-dasharray: 5 5
+        X_LoopIn("Output from previous loop or X_Ctx") --> BL1("BlockLinear + Norm + Act") --> X_LoopOut["(deter_dim, B)"]
+    end
+
+    subgraph GRU Update
+        X_LoopOut --"Input to GRU Block"--> BL_GRU(BlockLinear) --> X_GRU_Out["(3*deter_dim, B)"]
+        X_GRU_Out --> F2G_GRU(flat2group) --> X_GRU_Grouped["(3*d/g, g, B)"]
+        X_GRU_Grouped --> Split("Split dim 1 into 3") --> G1["Gate 1 (d/g,g,B)"] & G2["Gate 2 (d/g,g,B)"] & G3["Gate 3 (d/g,g,B)"]
+
+        G1 --> G2F1(group2flat) --> Gate1_Flat["(deter_dim, B)"]
+        G2 --> G2F2(group2flat) --> Gate2_Flat["(deter_dim, B)"]
+        G3 --> G2F3(group2flat) --> Gate3_Flat["(deter_dim, B)"]
+
+        Gate1_Flat --> Sig1(sigmoid) --> ResetGate[reset]
+        Gate2_Flat --> ResetMul["reset * Gate2_Flat"]
+        ResetGate --> ResetMul
+        ResetMul --> Tanh(tanh) --> CandState[cand]
+
+        Gate3_Flat --> Sub1("subtract 1") --> Sig2(sigmoid) --> UpdateGate[update]
+
+        UpdateGate --> UpdateTerm["update * cand"]
+        CandState --> UpdateTerm
+
+        UpdateGate --> InvUpdate["1 - update"]
+        D_prev --"Old State"--> PrevTerm["(1-update) * D_prev"]
+        InvUpdate --> PrevTerm
+
+        UpdateTerm --> AddFinal(Add)
+        PrevTerm --> AddFinal
+    end
+
+    subgraph Output State
+         AddFinal --> D_new[New deter]
+    end
+
+    %% Styling
+    style OpD fill:#f9f,stroke:#333,stroke-width:2px
+    style OpS fill:#f9f,stroke:#333,stroke-width:2px
+    style OpA fill:#f9f,stroke:#333,stroke-width:2px
+    style OpRpt fill:#ccf,stroke:#333,stroke-width:2px
+    style OpF2G_D fill:#ccf,stroke:#333,stroke-width:2px
+    style OpG2F fill:#ccf,stroke:#333,stroke-width:2px
+    style Cat1 fill:#ffc,stroke:#333,stroke-width:2px
+    style Cat2 fill:#ffc,stroke:#333,stroke-width:2px
+    style BL1 fill:#adf,stroke:#333,stroke-width:2px
+    style BL_GRU fill:#adf,stroke:#333,stroke-width:2px
+    style F2G_GRU fill:#ccf,stroke:#333,stroke-width:2px
+    style Split fill:#ccf,stroke:#333,stroke-width:2px
+    style G2F1 fill:#ccf,stroke:#333,stroke-width:2px
+    style G2F2 fill:#ccf,stroke:#333,stroke-width:2px
+    style G2F3 fill:#ccf,stroke:#333,stroke-width:2px
+    style Sig1 fill:#fde,stroke:#333,stroke-width:2px
+    style Sig2 fill:#fde,stroke:#333,stroke-width:2px
+    style Tanh fill:#fde,stroke:#333,stroke-width:2px
+    style Sub1 fill:#fde,stroke:#333,stroke-width:2px
+    style ResetMul fill:#aec,stroke:#333,stroke-width:2px
+    style UpdateTerm fill:#aec,stroke:#333,stroke-width:2px
+    style PrevTerm fill:#aec,stroke:#333,stroke-width:2px
+    style InvUpdate fill:#aec,stroke:#333,stroke-width:2px
+    style AddFinal fill:#aec,stroke:#333,stroke-width:2px

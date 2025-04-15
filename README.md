@@ -1,5 +1,14 @@
 # dreamerv3
 
+## To run the original model:
+```bash
+python original-dreamerV3/dreamerv3/dreamerv3/main.py \
+  --logdir ~/logdir/debug_run_{timestamp} \
+  --configs atari debug \
+  --task atari_pong \
+  --run.steps 100
+```
+
 ## To do
 
 **Main goal**
