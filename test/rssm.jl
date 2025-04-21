@@ -1,4 +1,5 @@
 using Lux, NNlib, Random, Tools, BFloat16s, YAML, Statistics, Test
+using Zygote
 include("../embodied/lux/rms.jl");
 include("../embodied/lux/nets.jl");
 include("../embodied/lux/BlockLinear.jl");
@@ -53,9 +54,62 @@ carry = initial_carry(rssm, B);
 println("  - Deterministic part: ", size(carry.deter), "          -> (deter_dim, B)")
 println("  - Stochastic part: ",    size(carry.stoch), "          -> (stoch_dim, classes_dim, B)")
 
-println(ANSI_GREEN, "\n----- Running RSSM _observe -----", ANSI_RESET)
+println(ANSI_GREEN, "\n----- Testing Loss Calculation -----", ANSI_RESET)
 action = [Int16(Tools.sample(act_space)) for _ in 1:T, _ in 1:B];
 reset = rand(rng, Bool, T, B);
+
+# loss_carry, loss_entry, loss_losses, loss_feat, loss_metrics =  loss(rssm, carry, tokens, action, reset, ps, st)
+carry, entry, feat = observe(rssm, carry, tokens, action, reset, ps, st);
+# Prior Calculation
+println(ANSI_BLUE, "\t Calculating Prior Logits", ANSI_RESET)
+# Reshape deter state: (deter_dim, T, B) -> (deter_dim, T*B)
+deter_seq = feat.deter # Shape: (deter_dim, T, B)
+_, T_actual, B_actual = size(deter_seq)
+deter_flat = reshape(deter_seq, rssm.deter_dim, T_actual * B_actual)
+println(ANSI_VIOLET, "\t    - Input deter shape: ", size(deter_seq), ANSI_RESET)
+println(ANSI_VIOLET, "\t    - Reshaped deter shape: ", size(deter_flat), ANSI_RESET)
+# Apply prior layers
+prior_features_flat, _ = rssm.imagination.prior_layers(deter_flat, ps.imagination.prior_layers, st.imagination.prior_layers);
+println(ANSI_VIOLET, "\t    - Features after prior_layers: ", size(prior_features_flat), ANSI_RESET)
+# Apply prior logit layer
+prior_logits_flat, _ = rssm.imagination.logit_prior(prior_features_flat, ps.imagination.logit_prior, st.imagination.logit_prior);
+println(ANSI_VIOLET, "\t    - Output after logit_prior (flat): ", size(prior_logits_flat), ANSI_RESET)
+# Reshape back to sequence: (stoch, classes, T*B) -> (stoch, classes, T, B)
+prior_logits = reshape(prior_logits_flat, rssm.stoch_dim, rssm.classes_dim, T_actual, B_actual)
+println(ANSI_VIOLET, "\t    - Final prior_logits shape: ", size(prior_logits), ANSI_RESET)
+
+post_logits = feat.logit; # Already has shape (stoch, classes, T, B) from observe
+
+# Calculate KL Divergence Losses
+println(ANSI_BLUE, "\t Calculating KL Divergence Losses", ANSI_RESET)
+
+# Create distribution objects
+post_dist = _dist(post_logits, rssm.unimix);
+prior_dist = _dist(prior_logits, rssm.unimix)
+
+# all(post_dist.logits .≈ post_logits)
+
+
+# Calculate KL divergences with appropriate stop_gradients
+# dyn_loss: Gradient flows through prior, posterior is constant target
+dyn_loss_elementwise = kl_divergence(_dist(dropgrad(post_logits), rssm.unimix), prior_dist)
+# rep_loss: Gradient flows through posterior, prior is constant target
+rep_loss_elementwise = kl_divergence(post_dist, _dist(dropgrad(prior_logits), rssm.unimix))
+
+# Apply free_nats clamping (element-wise)
+dyn_loss_clamped = max.(dyn_loss_elementwise, rssm.free_nats)
+rep_loss_clamped = max.(rep_loss_elementwise, rssm.free_nats)
+
+# Aggregate losses (e.g., mean over all remaining dimensions)
+# Assuming shape is (stoch_dim, T, B)
+dyn_loss_scalar = mean(dyn_loss_clamped)
+rep_loss_scalar = mean(rep_loss_clamped)
+
+
+println(ANSI_VIOLET, "\t    - Dyn Loss (Elementwise Shape): ", size(dyn_loss_elementwise), ANSI_RESET)
+println(ANSI_VIOLET, "\t    - Rep Loss (Elementwise Shape): ", size(rep_loss_elementwise), ANSI_RESET)
+
+println(ANSI_GREEN, "\n----- Running RSSM _observe -----", ANSI_RESET)
 t = 1
 
 # 

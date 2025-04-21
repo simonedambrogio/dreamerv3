@@ -9,7 +9,7 @@ include("../embodied/lux/ReArrange.jl");
 # Note: We might need more includes later as we add specific layers
 
 # Based on Python RSSM class attributes
-struct RSSM{AS, CN, PO} <: Lux.AbstractLuxContainerLayer{(:core, :observation)} # Added AS for type stability
+struct RSSM{AS, CN, PO, OI} <: Lux.AbstractLuxContainerLayer{(:core, :observation, :imagination)} # Added AS for type stability
     deter_dim::Int
     hidden_dim::Int
     stoch_dim::Int
@@ -27,6 +27,7 @@ struct RSSM{AS, CN, PO} <: Lux.AbstractLuxContainerLayer{(:core, :observation)} 
     # Sub-layers defined in core
     core::CN
     observation::PO
+    imagination::OI
 end
 
 function RSSM(; # Constructor
@@ -106,17 +107,18 @@ function RSSM(; # Constructor
     end
     posterior_layers = Chain(posterior_layers_list...; name="posterior_layers")
 
-    # Prior layers (obs + obsnorm)
+    # Prior layers
     prior_layers_list = []
-    first_obs_input_dim = deter_dim + token_dim
-    current_obs_input_dim = first_obs_input_dim
+    # Prior only depends on deter_dim
+    current_prior_input_dim = deter_dim 
 
-    for _ in 1:obslayers # Use the obslayers field
+    for _ in 1:imglayers # Use the imglayers field from RSSM struct
         push!(prior_layers_list, Chain(
-            Dense(current_obs_input_dim => hidden_dim; init_weight=cast_glorot_uniform, init_bias=cast_zeros),
+            # Use current_prior_input_dim correctly
+            Dense(current_prior_input_dim => hidden_dim; init_weight=cast_glorot_uniform, init_bias=cast_zeros),
             RMSNorm((hidden_dim,), act; dims=(1,), init_scale=cast_ones)
         ))
-        current_obs_input_dim = hidden_dim # Output of Norm is input to next Dense
+        current_prior_input_dim = hidden_dim # Output of Norm is input to next Dense
     end
     prior_layers = Chain(prior_layers_list...; name="prior_layers")
 
@@ -139,8 +141,10 @@ function RSSM(; # Constructor
     )
     observation_layers = (
         posterior_layers = posterior_layers,
-        prior_layers = prior_layers,
         logit_posterior = logit_posterior,
+    )
+    imagination_layers = (
+        prior_layers = prior_layers,
         logit_prior = logit_prior
     )
 
@@ -148,7 +152,7 @@ function RSSM(; # Constructor
     # Automatically determine types AS, CN, PO
     return RSSM(deter_dim, hidden_dim, stoch_dim, classes_dim, act, unroll, unimix, 
                 imglayers, obslayers, dynlayers, blocks, free_nats, 
-                token_dim, act_space, core_layers, observation_layers)
+                token_dim, act_space, core_layers, observation_layers, imagination_layers)
 end
 
 
@@ -161,7 +165,11 @@ Output shape: (deter = (batch_size, deter_dim), stoch = (batch_size, stoch_dim, 
 function LuxCore.initialstates(rng::AbstractRNG, rssm::RSSM)
     # Delegate state initialization to the sub-layers stored in rssm.core
     # This will recursively call initialstates on the layers within the core NamedTuple.
-    return (; core = Lux.initialstates(rng, rssm.core), observation = Lux.initialstates(rng, rssm.observation))
+    return (; 
+        core = Lux.initialstates(rng, rssm.core), 
+        observation = Lux.initialstates(rng, rssm.observation),
+        imagination = Lux.initialstates(rng, rssm.imagination)
+    )
 end
 
 """
@@ -180,6 +188,53 @@ function initial_carry(rssm::RSSM, batch_size::Int)
     # Use LuxCore.initialstates to get states for any potential stateful sub-layers later
     # For now, the state only contains the carry-over tensors.
     return (; deter = deter_init, stoch = stoch_init)
+end
+
+# Placeholder signature - adjust as needed
+function observe(rssm::RSSM, carry, tokens, action, reset, ps, st)
+    # seq_tokens shape: (token_dim, T, B)
+    # seq_actions shape: (T, B) - Assuming discrete actions passed in
+    # seq_resets shape: (T, B)
+
+    T = size(tokens, 2) # Get sequence length
+    B = size(tokens, 3) # Get batch size
+
+    # Initialize output storage
+    # Need to determine the exact structure and element types based on _observe's return
+    # Example: Assuming entry=(deter=..., stoch=...), feat=(deter=..., stoch=..., logit=...)
+    compute_T = eltype(carry.deter)
+    seq_deter = similar(carry.deter, rssm.deter_dim, T, B)
+    seq_stoch = similar(carry.stoch, rssm.stoch_dim, rssm.classes_dim, T, B)
+    seq_logit = similar(carry.stoch, rssm.stoch_dim, rssm.classes_dim, T, B)
+
+    current_carry = carry
+    # --- Loop over time steps ---
+    for t in 1:T
+        # Get inputs for the current time step
+        tokens_t = view(tokens, :, t, :) # Shape: (token_dim, B)
+        action_t = view(action, t, :)   # Shape: (B,)
+        reset_t = view(reset, t, :)     # Shape: (B,)
+
+        # Call the single-step observe function
+        # NOTE: _observe should probably return the updated state st as well
+        carry_next, (entry_t, feat_t) = _observe(rssm, current_carry, tokens_t, action_t, reset_t, ps, st);
+
+        # Store results for this time step
+        seq_deter[:, t, :] = entry_t.deter
+        seq_stoch[:, :, t, :] = entry_t.stoch
+        seq_logit[:, :, t, :] = feat_t.logit
+
+        # Update carry for the next iteration
+        current_carry = carry_next
+    end
+
+    # --- Prepare final outputs ---
+    final_carry = current_carry
+    # Combine collected entries/features into NamedTuples
+    final_feat = (; deter=seq_deter, stoch=seq_stoch, logit=seq_logit) # Example
+    final_entry = (; deter=seq_deter, stoch=seq_stoch) # Example
+
+    return final_carry, final_entry, final_feat
 end
 
 function _observe(rssm::RSSM, carry::NamedTuple, tokens, action::AbstractVector{<:Integer}, reset::AbstractVector{Bool}, ps, st)
@@ -210,15 +265,15 @@ function _observe(rssm::RSSM, carry::NamedTuple, tokens, action::AbstractVector{
     action = action_onehot_casted .* deter_mask # Broadcast (1, Batch) mask
 
     # --- 3. Core Recurrent Update (Transition Model) ---
-    deter_current, st_core = _core(rssm, deter, stoch, action, ps, st)
+    deter_current, _ = _core(rssm, deter, stoch, action, ps, st)
     
     # --- 4. Observation Update (Posterior Calculation) ---
     # 4.1 Combine current deter and tokens
     tokens = reshape(tokens, :, size(deter_current, ndims(deter_current)));
     x = vcat(deter_current, tokens)
     # 4.2 Apply Posterior Layers
-    x_posterior, st_posterior = rssm.observation.posterior_layers(x, ps.observation.posterior_layers, st.observation.posterior_layers)
-    logit_posterior, st_logit_posterior = rssm.observation.logit_posterior(x_posterior, ps.observation.logit_posterior, st.observation.logit_posterior)
+    x_posterior, _ = rssm.observation.posterior_layers(x, ps.observation.posterior_layers, st.observation.posterior_layers)
+    logit_posterior, _ = rssm.observation.logit_posterior(x_posterior, ps.observation.logit_posterior, st.observation.logit_posterior)
     # 4d. Sample new stochastic state from posterior distribution
     dist_posterior = _dist(logit_posterior, rssm.unimix)
     stoch_current = rand(rng, dist_posterior) # Assuming rng is available
@@ -300,8 +355,77 @@ function _core(rssm::RSSM, deter::AbstractArray, stoch::AbstractArray, action::A
     return deter_next, st_updated
 end
 
-# TODO: Define sub-layers and constructor
-# TODO: Update struct definition to be a ContainerLayer
+function _prior(rssm::RSSM, deter_seq::AbstractArray, ps, st)
+    # Helper to compute prior logits from deterministic sequence
+    # Input deter_seq shape: (deter_dim, T, B)
+    D, T, B = size(deter_seq)
+
+    # Reshape input for layers: (D, T, B) -> (D, T*B)
+    deter_flat = reshape(deter_seq, D, T * B)
+
+    # Apply prior feature layers
+    # Use imagination parameters and state
+    prior_features_flat, _ = rssm.imagination.prior_layers(deter_flat, ps.imagination.prior_layers, st.imagination.prior_layers)
+
+    # Apply prior logit layer
+    prior_logits_flat, _ = rssm.imagination.logit_prior(prior_features_flat, ps.imagination.logit_prior, st.imagination.logit_prior)
+
+    # Reshape output back: (S, C, T*B) -> (S, C, T, B)
+    prior_logits_seq = reshape(prior_logits_flat, rssm.stoch_dim, rssm.classes_dim, T, B)
+
+    # Note: Might need to return updated state if layers become stateful
+    return prior_logits_seq
+end
+
+function loss(rssm::RSSM, carry, tokens, action, reset, ps, st)
+    # carry: NamedTuple with .deter and .stoch
+    # tokens: Encoded observations, shape (token_dim, T, B)
+    # action: Discrete action indices for the current step, shape (T, B)
+    # reset: Boolean vector for the current step, shape (T, B)
+
+    carry, entry, feat = observe(rssm, carry, tokens, action, reset, ps, st);
+
+    # Prior and Posterior Distributions Logits
+    post_logits = feat.logit # Shape: (S, C, T, B)
+    prior_logits = _prior(rssm, feat.deter, ps, st) # Shape: (S, C, T, B)
+
+    # KL Divergence Losses
+    post_dist = _dist(post_logits, rssm.unimix);
+    prior_dist = _dist(prior_logits, rssm.unimix);
+
+    # Calculate elementwise KL (Shape: S, T, B)
+    dyn_elementwise = kl_divergence(_dist(dropgrad(post_logits), rssm.unimix), prior_dist)
+    rep_elementwise = kl_divergence(post_dist, _dist(dropgrad(prior_logits), rssm.unimix))
+
+    # Apply free_nats clamp (Shape: S, T, B)
+    dyn_clamped = max.(dyn_elementwise, rssm.free_nats)
+    rep_clamped = max.(rep_elementwise, rssm.free_nats)
+
+    # Sum over stochastic dimension (dim=1) to match Agg behavior
+    dyn_summed = sum(dyn_clamped; dims=1) # Shape: (1, T, B)
+    rep_summed = sum(rep_clamped; dims=1) # Shape: (1, T, B)
+
+    # Calculate final scalar loss by averaging over remaining dims (T and B)
+    dyn_scalar = mean(dyn_summed)
+    rep_scalar = mean(rep_summed)
+
+    # Store scalar losses (using NamedTuple for type stability)
+    losses = (; dyn = dyn_scalar, rep = rep_scalar)
+
+    # --- Calculate Metrics ---
+    prior_entropy_elementwise = entropy(prior_dist) # Shape: (S, T, B)
+    post_entropy_elementwise = entropy(post_dist)   # Shape: (S, T, B)
+
+    # Average entropy over all dimensions (S, T, B) to get scalar metrics
+    prior_entropy_scalar = mean(prior_entropy_elementwise)
+    post_entropy_scalar = mean(post_entropy_elementwise)
+
+    metrics = (; dyn_ent = prior_entropy_scalar, rep_ent = post_entropy_scalar)
+
+    # Placeholder return - return the losses, state, and metrics
+    return carry, entry, losses, feat, metrics # Updated return
+
+end
 
 # --- Distribution Helper ---
 
@@ -385,5 +509,78 @@ function Base.rand(rng::AbstractRNG, d::OneHotDist)
 end
 
 # --- End Distribution Helper ---
+
+using NNlib: logsoftmax, softmax # Ensure these are available
+
+"""
+    kl_divergence(posterior_dist::OneHotDist, prior_dist::OneHotDist)
+
+Computes the KL divergence D_KL(posterior || prior) for each batch element,
+summed over the classes dimension but kept separate for the stoch dimension.
+
+Assumes logits represent the parameters of the *unsmoothed* distributions.
+Uses logsoftmax for numerical stability.
+
+Args:
+    posterior_dist: OneHotDist representing the posterior distribution P.
+    prior_dist: OneHotDist representing the prior distribution Q.
+
+Returns:
+    Tensor of KL divergences, shape (stoch_dim, Batch...)
+"""
+function kl_divergence(posterior_dist::OneHotDist, prior_dist::OneHotDist)
+    # Extract the logits arrays from the distribution structs
+    post_logits = posterior_dist.logits
+    prior_logits = prior_dist.logits
+
+    # Calculate log-probabilities using logsoftmax for numerical stability
+    log_p = logsoftmax(post_logits; dims=2)
+    log_q = logsoftmax(prior_logits; dims=2)
+
+    # Calculate probabilities needed for the expectation E_p[...]
+    p = softmax(post_logits; dims=2)
+
+    # KL = sum_i p_i * (log p_i - log q_i)
+    # Sum over the classes dimension (dim=2)
+    kl_elementwise = p .* (log_p .- log_q)
+    kl_summed_over_classes = sum(kl_elementwise; dims=2)
+
+    # Remove the classes dimension (which is now size 1)
+    kl_final = dropdims(kl_summed_over_classes; dims=2)
+
+    return kl_final
+end
+
+"""
+    entropy(d::OneHotDist)
+
+Computes the entropy H(P) = - sum_i P(i) log P(i) for each distribution.
+
+Assumes logits represent the parameters of the *unsmoothed* distributions.
+Uses logsoftmax/softmax for numerical stability.
+
+Args:
+    d: OneHotDist representing the distribution P.
+
+Returns:
+    Tensor of entropies, shape (stoch_dim, Batch...)
+"""
+function entropy(d::OneHotDist)
+    logits = d.logits # Shape: (S, C, Batch...)
+
+    # Calculate log probabilities and probabilities using numerically stable functions
+    log_p = logsoftmax(logits; dims=2) # log P(i)
+    p = softmax(logits; dims=2)      # P(i)
+
+    # Entropy = - sum_i p_i * log p_i
+    # Sum over the classes dimension (dim=2)
+    entropy_elementwise = -p .* log_p
+    entropy_summed = sum(entropy_elementwise; dims=2) # Shape: (S, 1, Batch...)
+
+    # Remove the classes dimension
+    entropy_final = dropdims(entropy_summed; dims=2) # Shape: (S, Batch...)
+
+    return entropy_final
+end
 
 
