@@ -1,10 +1,12 @@
-using Lux, NNlib, Random, Tools, LuxCore
-include("../embodied/lux/rms.jl");
-include("../embodied/lux/nets.jl");
+using Lux, NNlib, Random, Tools, BFloat16s, YAML, Statistics, LuxCore
+# include("../embodied/lux/rms.jl");
+# include("../embodied/lux/nets.jl");
+# include("../embodied/lux/BlockLinear.jl");
+# include("../embodied/lux/ReArrange.jl");
 
 struct Encoder{T} <: Lux.AbstractLuxContainerLayer{(:convolve,)}
     act::Function
-    mults::Tuple
+    mults::Vector
     depth::Int
     kernel::Int
     convolve::T
@@ -13,7 +15,7 @@ end
 function Encoder(;
     obs::Space,
     act::Function=gelu,
-    mults::Tuple=(2, 3, 4, 4),
+    mults::Vector=[2, 3, 4, 4],
     depth::Int=64,
     kernel::Int=5)
 
@@ -141,4 +143,35 @@ function (enc::Encoder)(obs, ps, st)
 
     return output, new_state
 end;
+
+
+# Helper function to calculate encoder output dimension based on config
+function calculate_encoder_output_dim(encoder_config, obs::Space)
+    # Assumes obs_space_image is Tuple like (W, H, C)
+    W, H, C_in = obs.size
+
+    # Extract relevant config
+    mults = encoder_config["mults"] # e.g., (2, 3, 4, 4)
+    depth = encoder_config["depth"] # e.g., 64
+    # kernel = encoder_config["kernel"] # Kernel size doesn't affect output shape with SamePad
+
+    depths = [depth * m for m in mults]
+
+    current_W, current_H = W, H
+
+    # Simulate the effect of Conv + MaxPool layers
+    for _ in 1:length(depths) # One MaxPool per depth level
+        # Conv with SamePad doesn't change W, H
+        # MaxPool((2, 2), stride=(2, 2)) halves W, H
+        current_W = current_W ÷ 2
+        current_H = current_H ÷ 2
+    end
+
+    # Final channel count is the last depth value
+    final_C = depths[end]
+
+    # The final flattened dimension
+    token_dim = current_W * current_H * final_C
+    return token_dim
+end
 

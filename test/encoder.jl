@@ -136,7 +136,7 @@ img_space = obs_space[:image];
 enc_kwargs = (
     obs = img_space,
     act = gelu,
-    mults = (2, 3, 4, 4), # Example mults
+    mults = [2, 3, 4, 4], # Example mults
     depth = 8,           # Smaller depth for faster testing
     kernel = 5
 )

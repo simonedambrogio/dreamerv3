@@ -22,7 +22,7 @@ stoch_dim = config["debug"]["agent"][".*\\.stoch"];
 classes_dim = config["debug"]["agent"][".*\\.classes"];
 
 act=gelu;
-mults=(2, 3, 4, 4);
+mults=[2, 3, 4, 4];
 kernel=5;
 bspace=8;
 

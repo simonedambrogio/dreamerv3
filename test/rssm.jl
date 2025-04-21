@@ -30,9 +30,11 @@ classes_dim = config["debug"]["agent"][".*\\.classes"];
 hidden_dim = config["debug"]["agent"][".*\\.hidden"];
 blocks = config["debug"]["agent"][".*\\.blocks"];
 
+
+
 act=gelu;
-mults=(2, 3, 4, 4);
-kernel=5;
+mults=config["defaults"]["agent"]["enc"]["simple"]["mults"];
+kernel=config["defaults"]["agent"]["enc"]["simple"]["kernel"];
 
 rng = Random.default_rng();
 
@@ -44,6 +46,9 @@ dummy_obs = (; image = dummy_image); # Use NamedTuple matching encoder input
 println("  - Input shape: ", size(dummy_obs[:image]), "     -> (W, H, C, T, B)")
 tokens, st_new = enc(dummy_obs, ps, st);
 println("  - Output shape: ", size(tokens),         "          -> (token_dim, T, B)")
+
+@test calculate_encoder_output_dim(Dict("mults" => mults, "depth" => depth), obs) == size(tokens, 1)
+
 
 println(ANSI_GREEN, "\n----- Running RSSM Initial State -----", ANSI_RESET)
 act_space = Tools.Space(Int32, low=0, high=18);
@@ -83,31 +88,44 @@ post_logits = feat.logit; # Already has shape (stoch, classes, T, B) from observ
 # Calculate KL Divergence Losses
 println(ANSI_BLUE, "\t Calculating KL Divergence Losses", ANSI_RESET)
 
-# Create distribution objects
+# Create distribution objects (using the helper from rssm.jl)
 post_dist = _dist(post_logits, rssm.unimix);
-prior_dist = _dist(prior_logits, rssm.unimix)
+prior_dist = _dist(prior_logits, rssm.unimix);
 
-# all(post_dist.logits .≈ post_logits)
-
-
-# Calculate KL divergences with appropriate stop_gradients
-# dyn_loss: Gradient flows through prior, posterior is constant target
-dyn_loss_elementwise = kl_divergence(_dist(dropgrad(post_logits), rssm.unimix), prior_dist)
-# rep_loss: Gradient flows through posterior, prior is constant target
-rep_loss_elementwise = kl_divergence(post_dist, _dist(dropgrad(prior_logits), rssm.unimix))
+# Calculate elementwise KL divergence (summed over classes) using function from rssm.jl
+# Shape: (stoch_dim, T, B)
+dyn_elementwise = kl_divergence(_dist(dropgrad(post_logits), rssm.unimix), prior_dist)
+rep_elementwise = kl_divergence(post_dist, _dist(dropgrad(prior_logits), rssm.unimix))
+println(ANSI_VIOLET, "\t    - KL Elementwise (dyn shape):  ", size(dyn_elementwise), ANSI_RESET)
 
 # Apply free_nats clamping (element-wise)
-dyn_loss_clamped = max.(dyn_loss_elementwise, rssm.free_nats)
-rep_loss_clamped = max.(rep_loss_elementwise, rssm.free_nats)
+# Shape: (stoch_dim, T, B)
+dyn_clamped = max.(dyn_elementwise, rssm.free_nats)
+rep_clamped = max.(rep_elementwise, rssm.free_nats)
 
-# Aggregate losses (e.g., mean over all remaining dimensions)
-# Assuming shape is (stoch_dim, T, B)
-dyn_loss_scalar = mean(dyn_loss_clamped)
-rep_loss_scalar = mean(rep_loss_clamped)
+# --- Match Python Agg(..., agg=jnp.sum) behavior ---
+# Sum over the stochastic dimension (dim=1)
+# Shape: (1, T, B)
+dyn_summed = sum(dyn_clamped; dims=1)
+rep_summed = sum(rep_clamped; dims=1)
 
+# Remove the singleton stochastic dimension
+# Shape: (T, B) - This matches the output shape of Python's losses['dyn'] / losses['rep']
+dyn_per_TB = dropdims(dyn_summed; dims=1)
+rep_per_TB = dropdims(rep_summed; dims=1)
+println(ANSI_VIOLET, "\t    - KL Per T,B (dyn shape):      ", size(dyn_per_TB), ANSI_RESET)
 
-println(ANSI_VIOLET, "\t    - Dyn Loss (Elementwise Shape): ", size(dyn_loss_elementwise), ANSI_RESET)
-println(ANSI_VIOLET, "\t    - Rep Loss (Elementwise Shape): ", size(rep_loss_elementwise), ANSI_RESET)
+# Calculate final scalar loss by averaging over T and B (like Python's .mean() called later)
+dyn_scalar = mean(dyn_per_TB)
+rep_scalar = mean(rep_per_TB)
+println(ANSI_VIOLET, "\t    - KL Scalar Mean (dyn value):  ", dyn_scalar, ANSI_RESET)
+
+# Store results (optional, depending on what you need later in the test)
+kl_losses_per_TB = (; dyn = dyn_per_TB, rep = rep_per_TB)
+kl_losses_scalar = (; dyn = dyn_scalar, rep = rep_scalar)
+
+println(ANSI_VIOLET, "\t    - Dyn Loss (Elementwise Shape): ", size(dyn_elementwise), ANSI_RESET)
+println(ANSI_VIOLET, "\t    - Rep Loss (Elementwise Shape): ", size(rep_elementwise), ANSI_RESET)
 
 println(ANSI_GREEN, "\n----- Running RSSM _observe -----", ANSI_RESET)
 t = 1

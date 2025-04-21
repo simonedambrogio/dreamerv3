@@ -2,10 +2,11 @@ using Lux, NNlib, Random, Tools, BFloat16s, YAML, Statistics, LuxCore, OneHotArr
 using StatsBase: Weights # Added for sampling
 using StatsBase
 using OneHotArrays: onehot # Added for encoding
-include("../embodied/lux/rms.jl");
-include("../embodied/lux/nets.jl");
-include("../embodied/lux/BlockLinear.jl");
-include("../embodied/lux/ReArrange.jl");
+using Zygote
+# include("../embodied/lux/rms.jl");
+# include("../embodied/lux/nets.jl");
+# include("../embodied/lux/BlockLinear.jl");
+# include("../embodied/lux/ReArrange.jl");
 # Note: We might need more includes later as we add specific layers
 
 # Based on Python RSSM class attributes
@@ -15,7 +16,6 @@ struct RSSM{AS, CN, PO, OI} <: Lux.AbstractLuxContainerLayer{(:core, :observatio
     stoch_dim::Int
     classes_dim::Int
     act::Function
-    unroll::Bool
     unimix::Float32
     imglayers::Int
     obslayers::Int
@@ -36,7 +36,6 @@ function RSSM(; # Constructor
     stoch_dim::Int = 32,
     classes_dim::Int = 32,
     act::Function = gelu,
-    unroll::Bool = false,
     unimix::Float32 = 0.01f0,
     imglayers::Int = 2,
     obslayers::Int = 1,
@@ -150,7 +149,7 @@ function RSSM(; # Constructor
 
     # --- Return RSSM Instance --- 
     # Automatically determine types AS, CN, PO
-    return RSSM(deter_dim, hidden_dim, stoch_dim, classes_dim, act, unroll, unimix, 
+    return RSSM(deter_dim, hidden_dim, stoch_dim, classes_dim, act, unimix, 
                 imglayers, obslayers, dynlayers, blocks, free_nats, 
                 token_dim, act_space, core_layers, observation_layers, imagination_layers)
 end
@@ -405,12 +404,10 @@ function loss(rssm::RSSM, carry, tokens, action, reset, ps, st)
     dyn_summed = sum(dyn_clamped; dims=1) # Shape: (1, T, B)
     rep_summed = sum(rep_clamped; dims=1) # Shape: (1, T, B)
 
-    # Calculate final scalar loss by averaging over remaining dims (T and B)
-    dyn_scalar = mean(dyn_summed)
-    rep_scalar = mean(rep_summed)
-
+    dyn = dropdims(dyn_summed; dims=1)
+    rep = dropdims(rep_summed; dims=1)
     # Store scalar losses (using NamedTuple for type stability)
-    losses = (; dyn = dyn_scalar, rep = rep_scalar)
+    losses = (; dyn = dyn, rep = rep)
 
     # --- Calculate Metrics ---
     prior_entropy_elementwise = entropy(prior_dist) # Shape: (S, T, B)
