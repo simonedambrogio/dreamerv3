@@ -296,7 +296,8 @@ begin
         logit_posterior, _ = rssm.observation.logit_posterior(x_posterior, ps.observation.logit_posterior, st.observation.logit_posterior)
         # 4d. Sample new stochastic state from posterior distribution
         dist_posterior = _dist(logit_posterior, rssm.unimix)
-        stoch_current = stoch # Assuming rng is available
+        # stoch_current = stoch # Assuming rng is available
+        stoch_current = Zygote.@ignore rand(rng, dist_posterior) # Assuming rng is available
 
         # --- 5. Prepare Outputs ---
         # Calculate components first
