@@ -17,18 +17,21 @@ function Encoder(;
     act::Function=gelu,
     mults::Vector=[2, 3, 4, 4],
     depth::Int=64,
-    kernel::Int=5)
+    kernel::Int=5,
+    cnn_keys::String="image")
 
 
     # construct the network ---------------------------------------------------
     depths = [depth * m for m in mults]
     channels = obs.size[3]
     layers = []
+    i = 0
+    in_depth = cnn_keys == "image" ? obs.size[3] : 0
     for (d_in, d_out) in zip(vcat(channels,depths[1:end-1]), depths)
         push!(layers, Conv((kernel, kernel), d_in => d_out, pad=SamePad(); init_weight=cast_glorot_uniform, init_bias=cast_zeros))  # Add padding
         push!(layers, MaxPool((2, 2), stride=(2, 2)))
-        # Normalize along the channel dimension
-        push!(layers, RMSNorm((d_out,), dims=(3,), act; init_scale=cast_ones))
+        # Add feature_dim=3, keep dims=(3,) for channel norm
+        push!(layers, RMSNorm((d_out,), 3, act; dims=(3,), init_scale=cast_ones))
     end
     nn = Chain(layers...)
 

@@ -54,17 +54,18 @@ where ``\gamma`` is a trainable parameter if `affine=true`.
 """
 @concrete struct RMSNorm{affine, N} <: AbstractLuxLayer
     shape::NTuple{N, Int} # Shape of the learnable parameter (e.g., (Channels,))
+    feature_dim::Int      # Which dimension index of the input does `shape` correspond to?
     activation
     epsilon
     init_scale
     dims                  # Dimensions to normalize OVER
 end
 
-function RMSNorm(shape::NTuple{N, <:Int}, activation=identity; # Removed feature_dim arg
+function RMSNorm(shape::NTuple{N, <:Int}, feature_dim::Int, activation=identity;
                 epsilon::T=1.0f-5, dims=Colon(), affine::Bool=true,
                 init_scale=ones32, allow_fast_activation::Bool=true) where {N, T}
     activation = allow_fast_activation ? NNlib.fast_act(activation) : activation
-    return RMSNorm{affine, N}(shape, activation, epsilon, init_scale, dims) # Removed feature_dim
+    return RMSNorm{affine, N}(shape, feature_dim, activation, epsilon, init_scale, dims)
 end
 
 # Check if the layer has a learnable scale parameter
@@ -72,15 +73,12 @@ end
 
 function Lux.initialparameters(rng::AbstractRNG, rn::RMSNorm)
     if _affine(rn)
-        # If affine=true, create a scale parameter initialized with the provided function
-        # This scale parameter will be learned during training
-        # Use the compute type defined in nets.jl if possible, otherwise default to Float32
-        compute_T = isdefined(@__MODULE__, :COMPUTE_TYPE) ? COMPUTE_TYPE : Float32
-        scale = rn.init_scale(rng, compute_T, rn.shape..., 1) # Ensure scale is compute_T
-        return (; scale=scale,) # Return NamedTuple consistent with Lux convention
+        scale_init_shape = rn.shape
+        isempty(scale_init_shape) && (scale_init_shape = (1,))
+        scale = rn.init_scale(rng, scale_init_shape...)
+        return (; scale=scale,)
     else
-        # If affine=false, no learnable parameters are needed
-        return NamedTuple() # Return empty NamedTuple consistent with Lux
+        return NamedTuple()
     end
 end
 
@@ -97,47 +95,21 @@ function (l::RMSNorm)(x::AbstractArray{T}, ps, st::NamedTuple) where T
 
     # Step 4: Apply the learnable scale parameter if affine=true
     if _affine(l)
-        scale_param = ps.scale # Original scale parameter
-        # --- ORIGINAL Mutable reshape logic --- 
-        local scale_param_squeezed
-        if ndims(scale_param) > length(l.shape) && size(scale_param)[end] == 1 && length(l.shape) > 0 # Avoid squeezing if shape is ()
-             scale_param_squeezed = dropdims(scale_param; dims=ndims(scale_param))
-        else
-             scale_param_squeezed = scale_param
-        end
-        expected_shape = isempty(l.shape) ? () : l.shape
-         if size(scale_param_squeezed) != expected_shape
-              error("RMSNorm scale parameter size $(size(scale_param_squeezed)) does not match expected shape $(expected_shape)")
-         end
-        reshape_target = ones(Int, ndims(x))
-        # Logic from before the immutable refactor
-        if length(l.shape) == 1 && l.dims isa NTuple{1, Int}
-            channel_dim = l.dims[1]
-            if ndims(x) >= channel_dim
-                reshape_target[channel_dim] = l.shape[1] # Set the channel dimension size
+        scale_param = ps.scale # Has shape l.shape, e.g. (F,) or (C,)
+        # --- Construct reshape_target immutably based on feature_dim ---
+        reshape_target_tuple = ntuple(ndims(x)) do d
+            if d == l.feature_dim
+                 # Use the parameter size for the specified feature dimension
+                 @assert length(l.shape) == 1 "RMSNorm currently only supports 1D parameter shapes for scale"
+                 l.shape[1]
             else
-                error("Input dimensions ($(ndims(x))) less than specified normalization dimension ($(channel_dim))")
+                 1 # Size 1 for all other dimensions
             end
-       else
-           shape_idx = 1
-           # Determine dimensions NOT being normalized
-           dims_to_normalize = l.dims isa Colon ? (1:(ndims(x) - 1)) : Int.(collect(l.dims))
-            for d in 1:ndims(x)
-                 if !(d in dims_to_normalize)
-                     if shape_idx <= length(l.shape)
-                         reshape_target[d] = l.shape[shape_idx]
-                         shape_idx += 1
-                     end
-                 end
-            end
-            # Optional: Warning check if needed
-            # if shape_idx <= length(l.shape) && !(l.dims isa Colon)
-            #      @warn "RMSNorm: Mismatch between l.shape $(l.shape) and non-normalized dimensions. Broadcasting might be incorrect."
-            # end
-       end
-       reshaped_scale = reshape(scale_param_squeezed, Tuple(reshape_target)...)
-       # --- End ORIGINAL Mutable reshape logic --- 
+         end
 
+        # Reshape the scale parameter (which has shape l.shape) to the target broadcast shape
+        reshaped_scale = reshape(scale_param, reshape_target_tuple)
+        # --- End immutable construction ---
         y = y_normalized .* reshaped_scale
     else
         y = y_normalized
@@ -152,7 +124,7 @@ end
 # # end
 
 function Base.show(io::IO, l::RMSNorm)
-    print(io, "RMSNorm($(l.shape)")
+    print(io, "RMSNorm($(l.shape), feature_dim=$(l.feature_dim)")
     (l.activation == identity) || print(io, ", $(l.activation)")
     print(io, ", affine=$(_affine(l)), dims=$(l.dims)")
     return print(io, ")")

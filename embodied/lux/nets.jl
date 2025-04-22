@@ -1,18 +1,78 @@
 using BFloat16s
+using ChainRulesCore # Need this for ZeroTangent, Tangent
 
-
-COMPUTE_TYPE = BFloat16
+# Define COMPUTE_TYPE globally if not already defined elsewhere
+# If it's defined in another central place, remove this.
+if !@isdefined(COMPUTE_TYPE)
+    const COMPUTE_TYPE = BFloat16
+end
 
 function cast(x::Number)
-    if x isa BFloat16
+    if x isa COMPUTE_TYPE
         return x
+    elseif x isa Bool # Handle Bool explicitly
+        return COMPUTE_TYPE(x)
+    elseif isnothing(x) || isa(x, ChainRulesCore.ZeroTangent)
+         return x # Pass through ZeroTangent/Nothing
+    elseif !isfinite(x)
+         @warn "Non-finite value encountered during cast: $x. Keeping original value." maxlog=1
+         return x # Keep original Float32 Inf/NaN if needed
     else
         return COMPUTE_TYPE(x)
     end
 end
 
 function cast(x::AbstractArray)
-    return COMPUTE_TYPE.(x)
+     if isnothing(x) || isa(x, ChainRulesCore.ZeroTangent)
+        return x
+     end
+    # Element-wise cast, applying the Number method's logic
+    # Use broadcast `.` to handle potential ZeroTangent elements if the array itself isn't ZeroTangent
+    return cast.(x)
+end
+
+# Cast for Tangents (handles NamedTuple backings)
+function cast(t::Tangent{P, T}) where {P, T<:NamedTuple}
+    # Check if all fields are ZeroTangent
+    if all(val -> isa(val, ChainRulesCore.ZeroTangent), t.backing)
+        return ChainRulesCore.ZeroTangent()
+    end
+    # Recursively cast the fields in the backing NamedTuple
+    new_backing = cast(t.backing)
+    # If casting resulted in all zero fields, return ZeroTangent
+    if isa(new_backing, ChainRulesCore.ZeroTangent)
+        return ChainRulesCore.ZeroTangent()
+    end
+    # Return new Tangent with casted backing
+    # Ensure the primal type P is preserved
+    return Tangent{P, typeof(new_backing)}(new_backing)
+end
+
+# Cast for regular NamedTuples (often used for gradients)
+function cast(nt::NamedTuple)
+     if all(val -> isa(val, ChainRulesCore.ZeroTangent), values(nt))
+         return ChainRulesCore.ZeroTangent()
+     end
+     # Recursively cast each field
+     casted_fields = map(values(nt)) do field
+        cast(field)
+    end
+    # Check if all casted fields are now ZeroTangent
+    if all(val -> isa(val, ChainRulesCore.ZeroTangent), casted_fields)
+        return ChainRulesCore.ZeroTangent()
+    end
+    # Reconstruct NamedTuple with original keys and casted values
+    return NamedTuple{keys(nt)}(casted_fields)
+end
+
+# Cast for ZeroTangent itself (identity)
+function cast(z::ChainRulesCore.ZeroTangent)
+    return z
+end
+
+# Cast for Nothing (identity)
+function cast(n::Nothing)
+    return n
 end
 
 function cast_zeros(rng::AbstractRNG, dims...)

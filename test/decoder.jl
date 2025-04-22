@@ -3,7 +3,6 @@ include("../embodied/lux/rms.jl");
 include("../embodied/lux/nets.jl");
 include("../embodied/lux/BlockLinear.jl");
 include("../embodied/lux/ReArrange.jl");
-include("../embodied/lux/UpSample.jl");
 include("../dreamerv3/decoder.jl");
 config = YAML.load_file("dreamerv3/configs.yaml");
 
@@ -28,9 +27,9 @@ bspace=8;
 
 rng = Random.default_rng();
 
-feat = Dict(
-    "deter" => cast(rand(rng, Float32, deter_dim, seq_length, batch_size)),
-    "stoch" => cast(rand(rng, Float32, stoch_dim, classes_dim, seq_length, batch_size)),
+feat = (;
+   deter = cast(rand(rng, Float32, deter_dim, seq_length, batch_size)),
+   stoch = cast(rand(rng, Float32, stoch_dim, classes_dim, seq_length, batch_size)),
 );
 reset = rand(rng, Bool, seq_length, batch_size);
 
@@ -157,7 +156,7 @@ print(ANSI_RESET) # End color
 
 
 # Test RMSNorm -------------------------------------------------------------
-rn = RMSNorm((2units,), act; dims = (1,), init_scale=cast_ones)
+rn = RMSNorm((2units,), 1, act; dims = (1,), init_scale=cast_ones)
 ps, st = Lux.setup(rng, rn);
 out_rn, st = rn(out_l, ps, st);
 size(out_rn)
@@ -200,7 +199,7 @@ println(ANSI_GREEN, "\n----- 3. Combine the Deterministic and Stochastic parts -
 x = out_deter + out_stoch
 # Normalize over Channel dimension (dim=3)
 # Scale parameter shape should match the normalized dim size: (C,) = (8,)
-rn = RMSNorm((c,), act; dims=(3,), init_scale=cast_ones) # Corrected shape
+rn = RMSNorm((c,), 3, act; dims=(3,), init_scale=cast_ones)
 ps, st = Lux.setup(rng, rn);
 out_combine, st = rn(x, ps, st);
 size(out_combine)
@@ -225,14 +224,12 @@ println(ANSI_GREEN, "\n----- 4. Apply decoder convolutions -----", ANSI_RESET)
 x = out_combine; # Input shape (W, H, C, Seq*Batch)
 
 # Test UpSample Layer ------------------------------------------------------
-# Use default factor=2, dims=(1, 2) which matches the previous repeat logic
-upsample_layer = UpSample(factor=2, dims=(1, 2))
+# Use Lux.Upsample directly
+upsample_layer = Lux.Upsample(:nearest; scale=(2, 2, 1, 1))
 ps_up, st_up = Lux.setup(rng, upsample_layer)
 x_upsampled, st_up_new = upsample_layer(x, ps_up, st_up)
-# apply upsampling (nearest neighbor via repeat)
-# Repeat 2x along dim 1 (W) and dim 2 (H), 1x along others
-# x_upsampled = repeat(x, inner=(2, 2, 1, 1)) # Replaced by UpSample layer test
-println(ANSI_BLUE, "Upsampling step (using `UpSample` layer)", ANSI_RESET) # Updated title
+
+println(ANSI_BLUE, "Upsampling step (using `Lux.Upsample` layer)", ANSI_RESET) # Updated title
 print(ANSI_ORANGE) # Start color
 println("  - Goal: Double the spatial dimensions (Width and Height) of the feature map.")
 println("  - Mechanism: Uses the custom `UpSample(:nearest)` layer, which internally uses `Base.repeat`.")
@@ -282,7 +279,7 @@ print(ANSI_RESET) # End color
 # Test Normalization -------------------------------------------------------------
 #  x = nn.act(self.act)(self.sub(f'conv{i}norm', nn.Norm, self.norm)(x))
 
-norm_layer = RMSNorm((depth_out,), act; dims=(3,), init_scale=cast_ones)
+norm_layer = RMSNorm((depth_out,), 3, act; dims=(3,), init_scale=cast_ones)
 ps_norm, st_norm = Lux.setup(rng, norm_layer)
 out_norm, st_norm_new = norm_layer(out_conv, ps_norm, st_norm)
 
@@ -299,15 +296,14 @@ print(ANSI_RESET) # End color
 println(ANSI_BLUE, "(Repeat Upsampling, Conv2D, Norm $(length(depths)-3) times)", ANSI_RESET)
 
 # Test UpSample Layer ------------------------------------------------------
-# Use default factor=2, dims=(1, 2) which matches the previous repeat logic
-x = rand32(48, 48, 4, 80)
-upsample_layer = UpSample()
+# Second manual test section
+x = rand32(48, 48, 4, 80) # Example input
+# Use Lux.Upsample directly
+upsample_layer = Lux.Upsample(:nearest; scale=(2, 2, 1, 1))
 ps_up, st_up = Lux.setup(rng, upsample_layer)
 x_upsampled, st_up_new = upsample_layer(x, ps_up, st_up)
-# apply upsampling (nearest neighbor via repeat)
-# Repeat 2x along dim 1 (W) and dim 2 (H), 1x along others
-# x_upsampled = repeat(x, inner=(2, 2, 1, 1)) # Replaced by UpSample layer test
-println(ANSI_BLUE, "Upsampling step (using `UpSample` layer)", ANSI_RESET) # Updated title
+
+println(ANSI_BLUE, "Upsampling step (using `Lux.Upsample` layer)", ANSI_RESET) # Updated title
 print(ANSI_ORANGE) # Start color
 println("  - Goal: Double the spatial dimensions (Width and Height) of the feature map.")
 println("  - Purpose here: Increase the spatial resolution before applying the next convolution,")

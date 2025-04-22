@@ -3,6 +3,9 @@ using StatsBase: Weights # Added for sampling
 using StatsBase
 using OneHotArrays: onehot # Added for encoding
 using Zygote
+using SliceMap # Needed for preparing scan input
+using ChainRulesCore
+using Zygote: @ignore
 # include("../embodied/lux/rms.jl");
 # include("../embodied/lux/nets.jl");
 # include("../embodied/lux/BlockLinear.jl");
@@ -57,15 +60,15 @@ function RSSM(; # Constructor
     # Layers for initial context processing (deter, stoch, action)
     layer_deter = Chain(
         Dense(deter_dim => hidden_dim; init_weight=cast_glorot_uniform, init_bias=cast_zeros),
-        RMSNorm((hidden_dim,), act; dims=(1,), init_scale=cast_ones)
+        RMSNorm((hidden_dim,), 1, act; dims=(1,), init_scale=cast_ones)
     )
     layer_stoch = Chain(
         Dense(stoch_dim * classes_dim => hidden_dim; init_weight=cast_glorot_uniform, init_bias=cast_zeros),
-        RMSNorm((hidden_dim,), act; dims=(1,), init_scale=cast_ones)
+        RMSNorm((hidden_dim,), 1, act; dims=(1,), init_scale=cast_ones)
     )
     layer_action = Chain(
         Dense(num_actions => hidden_dim; init_weight=cast_glorot_uniform, init_bias=cast_zeros),
-        RMSNorm((hidden_dim,), act; dims=(1,), init_scale=cast_ones)
+        RMSNorm((hidden_dim,), 1, act; dims=(1,), init_scale=cast_ones)
     )
 
     # Dynamic layers loop (dynhid + dynhidnorm)
@@ -79,7 +82,7 @@ function RSSM(; # Constructor
     for _ in 1:dynlayers
         push!(gru_layers_list, Chain(
             BlockLinear(current_dyn_input_dim, deter_dim, g; init_weight=cast_glorot_uniform, init_bias=cast_zeros),
-            RMSNorm((deter_dim,), act; dims=(1,), init_scale=cast_ones)
+            RMSNorm((deter_dim,), 1, act; dims=(1,), init_scale=cast_ones)
         ))
         current_dyn_input_dim = deter_dim # Input for subsequent layers is the output of the previous one
     end
@@ -100,7 +103,7 @@ function RSSM(; # Constructor
     for _ in 1:obslayers # Use the obslayers field
         push!(posterior_layers_list, Chain(
             Dense(current_obs_input_dim => hidden_dim; init_weight=cast_glorot_uniform, init_bias=cast_zeros),
-            RMSNorm((hidden_dim,), act; dims=(1,), init_scale=cast_ones)
+            RMSNorm((hidden_dim,), 1, act; dims=(1,), init_scale=cast_ones)
         ))
         current_obs_input_dim = hidden_dim # Output of Norm is input to next Dense
     end
@@ -115,7 +118,7 @@ function RSSM(; # Constructor
         push!(prior_layers_list, Chain(
             # Use current_prior_input_dim correctly
             Dense(current_prior_input_dim => hidden_dim; init_weight=cast_glorot_uniform, init_bias=cast_zeros),
-            RMSNorm((hidden_dim,), act; dims=(1,), init_scale=cast_ones)
+            RMSNorm((hidden_dim,), 1, act; dims=(1,), init_scale=cast_ones)
         ))
         current_prior_input_dim = hidden_dim # Output of Norm is input to next Dense
     end
@@ -189,22 +192,26 @@ function initial_carry(rssm::RSSM, batch_size::Int)
     return (; deter = deter_init, stoch = stoch_init)
 end
 
-# Placeholder signature - adjust as needed
 function observe(rssm::RSSM, carry, tokens, action, reset, ps, st)
     # seq_tokens shape: (token_dim, T, B)
-    # seq_actions shape: (T, B) - Assuming discrete actions passed in
+    # seq_actions shape: (T, B)
     # seq_resets shape: (T, B)
 
     T = size(tokens, 2) # Get sequence length
     B = size(tokens, 3) # Get batch size
 
-    # Initialize output storage
-    # Need to determine the exact structure and element types based on _observe's return
-    # Example: Assuming entry=(deter=..., stoch=...), feat=(deter=..., stoch=..., logit=...)
-    compute_T = eltype(carry.deter)
-    seq_deter = similar(carry.deter, rssm.deter_dim, T, B)
-    seq_stoch = similar(carry.stoch, rssm.stoch_dim, rssm.classes_dim, T, B)
-    seq_logit = similar(carry.stoch, rssm.stoch_dim, rssm.classes_dim, T, B)
+    # --- Pre-allocate Output Arrays (Buffer Approach) ---
+    # Determine element type from carry (assuming consistency)
+    el_type = eltype(carry.deter)
+
+    # Allocate arrays to store the full sequences
+    # Shapes: (feature_dim, T, B) or (feature_dim1, feature_dim2, T, B)
+    seq_deter_out = similar(tokens, el_type, rssm.deter_dim, T, B)
+    # Assuming entry.stoch and feat.logit have same shape structure as initial carry.stoch
+    stoch_dims = size(carry.stoch)[1:end-1] # Get stoch dims excluding Batch
+    seq_stoch_out = similar(tokens, el_type, stoch_dims..., T, B)
+    seq_logit_out = similar(tokens, el_type, stoch_dims..., T, B)
+
 
     current_carry = carry
     # --- Loop over time steps ---
@@ -215,13 +222,14 @@ function observe(rssm::RSSM, carry, tokens, action, reset, ps, st)
         reset_t = view(reset, t, :)     # Shape: (B,)
 
         # Call the single-step observe function
-        # NOTE: _observe should probably return the updated state st as well
-        carry_next, (entry_t, feat_t) = _observe(rssm, current_carry, tokens_t, action_t, reset_t, ps, st);
+        carry_next, entry_t, feat_t = _observe(rssm, current_carry, tokens_t, action_t, reset_t, ps, st);
 
-        # Store results for this time step
-        seq_deter[:, t, :] = entry_t.deter
-        seq_stoch[:, :, t, :] = entry_t.stoch
-        seq_logit[:, :, t, :] = feat_t.logit
+        # Store results for this time step directly into pre-allocated arrays
+        view(seq_deter_out, :, t, :) .= entry_t.deter
+        # Use ellipsis `..` for stoch/logit dimensions before T and B
+        view(seq_stoch_out, :, :, t, :) .= entry_t.stoch # Shape (S, C, B)
+        view(seq_logit_out, :, :, t, :) .= feat_t.logit  # Shape (S, C, B)
+
 
         # Update carry for the next iteration
         current_carry = carry_next
@@ -229,14 +237,185 @@ function observe(rssm::RSSM, carry, tokens, action, reset, ps, st)
 
     # --- Prepare final outputs ---
     final_carry = current_carry
-    # Combine collected entries/features into NamedTuples
-    final_feat = (; deter=seq_deter, stoch=seq_stoch, logit=seq_logit) # Example
-    final_entry = (; deter=seq_deter, stoch=seq_stoch) # Example
+    # The pre-allocated arrays now hold the full sequences
+    final_feat = (; deter=seq_deter_out, stoch=seq_stoch_out, logit=seq_logit_out)
+    final_entry = (; deter=seq_deter_out, stoch=seq_stoch_out)
 
     return final_carry, final_entry, final_feat
 end
 
-function _observe(rssm::RSSM, carry::NamedTuple, tokens, action::AbstractVector{<:Integer}, reset::AbstractVector{Bool}, ps, st)
+function ChainRulesCore.rrule(::typeof(observe), rssm::RSSM, carry_in::NamedTuple, tokens::AbstractArray, action::AbstractArray, reset::AbstractArray, ps::NamedTuple, st::NamedTuple)
+    # --- Forward Pass --- (Essentially the original observe function)
+    T = size(tokens, 2)
+    B = size(tokens, 3)
+    el_type = eltype(carry_in.deter)
+    seq_deter_out = similar(tokens, el_type, rssm.deter_dim, T, B)
+    stoch_dims = size(carry_in.stoch)[1:end-1]
+    seq_stoch_out = similar(tokens, el_type, stoch_dims..., T, B)
+    seq_logit_out = similar(tokens, el_type, stoch_dims..., T, B)
+
+    # Store intermediate carries for the pullback
+    carries_intermediate = Vector{typeof(carry_in)}(undef, T)
+
+    current_carry = carry_in
+    for t in 1:T
+        tokens_t = view(tokens, :, t, :)
+        action_t = view(action, t, :)
+        reset_t = view(reset, t, :)
+
+        # Store carry *before* the step
+        carries_intermediate[t] = current_carry
+
+        carry_next, entry_t, feat_t = _observe(rssm, current_carry, tokens_t, action_t, reset_t, ps, st);
+
+        # Assign results (mutation happens here, but Zygote won't see it)
+        view(seq_deter_out, :, t, :) .= entry_t.deter
+        view(seq_stoch_out, :, :, t, :) .= entry_t.stoch
+        view(seq_logit_out, :, :, t, :) .= feat_t.logit
+
+        current_carry = carry_next
+    end
+    final_carry = current_carry
+    final_feat = (; deter=seq_deter_out, stoch=seq_stoch_out, logit=seq_logit_out)
+    final_entry = (; deter=seq_deter_out, stoch=seq_stoch_out)
+
+    # --- Pullback Definition ---
+    function observe_pullback(Δoutputs)
+        # Δoutputs is a tuple: (Δfinal_carry, Δfinal_entry, Δfinal_feat)
+        Δfinal_carry = Δoutputs[1] # Gradient w.r.t. the last carry state
+        Δfinal_entry = Δoutputs[2] # Gradient w.r.t. the entry sequence tuple (deter, stoch)
+        Δfinal_feat = Δoutputs[3]  # Gradient w.r.t. the feat sequence tuple (deter, stoch, logit)
+
+        # Initialize zero tangents for inputs - create full arrays now
+        Δps = Zygote.zero_tangent(ps)
+        # Use zero.() instead of non-existent Zygote.zeros_like
+        Δtokens = zero.(tokens)
+        Δaction = zero.(action)
+        Δreset = zero.(reset)
+        Δcarry_accum = Zygote.zero_tangent(carry_in)
+
+        Δcarry_t_plus_1 = Δfinal_carry
+
+        for t in T:-1:1
+            carry_t = carries_intermediate[t]
+            tokens_t = view(tokens, :, t, :)
+            action_t = view(action, t, :)
+            reset_t = view(reset, t, :)
+
+            # --- Initialize and Accumulate Output Gradients for _observe step t ---
+            # Use expected output types (BFloat16) for zero tangents
+            el_type_expected = COMPUTE_TYPE
+            # Use carry_t for shape reference, but ensure eltype is el_type_expected
+            zero_deter = Zygote.zero_tangent(similar(carry_t.deter, el_type_expected))
+            zero_stoch = Zygote.zero_tangent(similar(carry_t.stoch, el_type_expected))
+            zero_logit = Zygote.zero_tangent(similar(carry_t.stoch, el_type_expected)) # Assume same shape/type as stoch
+
+            # Initialize components explicitly (as BFloat16 zero tangents)
+            Δdeter_entry_accum = zero_deter
+            Δstoch_entry_accum = zero_stoch
+            Δdeter_feat_accum = zero_deter
+            Δstoch_feat_accum = zero_stoch
+            Δlogit_feat_accum = zero_logit
+
+            # Accumulate from Δfinal_entry (Gradients w.r.t `entry` sequence)
+            if !isnothing(Δfinal_entry) && !isa(Δfinal_entry, ZeroTangent)
+                # Cast incoming gradients before adding, just in case they mixed somewhere
+                Δdeter_entry_accum = Δdeter_entry_accum + cast(view(Δfinal_entry.deter, :, t, :))
+                Δstoch_entry_accum = Δstoch_entry_accum + cast(view(Δfinal_entry.stoch, :, :, t, :))
+            end
+
+            # Accumulate from Δfinal_feat (Gradients w.r.t `feat` sequence)
+            if !isnothing(Δfinal_feat) && !isa(Δfinal_feat, ZeroTangent)
+                # Cast Float32 gradients back to BFloat16 before adding
+                Δdeter_feat_accum = Δdeter_feat_accum + cast(view(Δfinal_feat.deter, :, t, :))
+                Δstoch_feat_accum = Δstoch_feat_accum + cast(view(Δfinal_feat.stoch, :, :, t, :))
+                Δlogit_feat_accum = Δlogit_feat_accum + cast(view(Δfinal_feat.logit, :, :, t, :))
+            end
+
+            # Construct tangents for _observe output matching (carry_next, entry, feat)
+            # Ensure types match expected BFloat16 output types
+            entry_t_expected_type = @NamedTuple{deter::Matrix{el_type_expected}, stoch::Array{el_type_expected, 3}}
+            feat_t_expected_type = @NamedTuple{deter::Matrix{el_type_expected}, stoch::Array{el_type_expected, 3}, logit::Array{el_type_expected, 3}}
+            carry_t_expected_type = @NamedTuple{deter::Matrix{el_type_expected}, stoch::Array{el_type_expected, 3}} # Type for carry
+
+            Δentry_t = Tangent{entry_t_expected_type}(; deter=Δdeter_entry_accum, stoch=Δstoch_entry_accum)
+            Δfeat_t = Tangent{feat_t_expected_type}(; deter=Δdeter_feat_accum, stoch=Δstoch_feat_accum, logit=Δlogit_feat_accum)
+
+            # Cast Δcarry_t_plus_1 to ensure it's the expected BFloat16 Tangent type
+            Δcarry_t_plus_1_casted = cast(Tangent{carry_t_expected_type}(; deter=Δcarry_t_plus_1.deter, stoch=Δcarry_t_plus_1.stoch))
+
+            # The structure passed to pullback_step must match the structure returned by _observe: (carry_next, entry, feat)
+            Δobserve_output_tuple = (Δcarry_t_plus_1_casted, Δentry_t, Δfeat_t)
+
+            # --- Call Zygote.pullback on _observe ---
+            _observe_pb = @ignore_derivatives Zygote.pullback(_observe, rssm, carry_t, tokens_t, action_t, reset_t, ps, st)
+            if isnothing(_observe_pb)
+                error("_observe function is not differentiable by Zygote.")
+            end
+            _, pullback_step = _observe_pb
+
+            # Apply the pullback for the single step
+            grads_step = pullback_step(Δobserve_output_tuple)
+
+            # Extract gradients for inputs of _observe
+            # grads_step = (∇_observe, ∇rssm, ∇carry_t, ∇tokens_t, ∇action_t, ∇reset_t, ∇ps, ∇st)
+            # Cast gradients received from pullback_step if necessary before accumulation
+            Δcarry_t = cast(grads_step[3]) # Cast gradient w.r.t carry_t
+            Δtokens_t = cast(grads_step[4])
+            Δaction_t = cast(grads_step[5]) # Action grad might be different type? Check Zygote output. Cast should handle ZeroTangent.
+            Δreset_t = grads_step[6] # Reset grad should be Nothing/ZeroTangent
+            Δps_t = cast(grads_step[7]) # Cast parameter gradients
+
+            # --- Accumulate Gradients (Explicitly, no in-place) ---
+            # Accumulate carry gradient (already casted)
+            # Handle potential ZeroTangent for Δcarry_accum initialization if carry_in was zero
+            if isa(Δcarry_accum, ZeroTangent) && !isa(Δcarry_t, ZeroTangent)
+                 Δcarry_accum = Δcarry_t # Initialize if first non-zero grad
+            elseif !isa(Δcarry_t, ZeroTangent)
+                 # Use Zygote's safe addition for NamedTuples/Tangents
+                 Δcarry_accum = Zygote.accum(Δcarry_accum, Δcarry_t)
+             end
+
+            # Accumulate into the full gradient arrays using view and + (Ensure casted grads)
+            if !isa(Δtokens_t, ZeroTangent)
+                current_token_grad_view = view(Δtokens, :, t, :)
+                # Ensure view is mutable if using .=
+                # Using explicit add and assign might be safer with views
+                view(Δtokens, :, t, :) .= current_token_grad_view .+ Δtokens_t
+            end
+
+            if !isa(Δaction_t, ZeroTangent)
+                 current_action_grad_view = view(Δaction, t, :)
+                 # Action gradient needs careful handling due to one-hot.
+                 # Zygote pullback for onehot should return gradient w.r.t indices?
+                 # Or w.r.t the onehot output? Assuming latter.
+                 # Gradient type might be Float, needs accumulation into Δaction (which is also Float?)
+                 # Let's assume Δaction is initialized correctly (e.g., zero.())
+                 # Check eltype of Δaction_t - should be COMPUTE_TYPE if it flowed through layers
+                 view(Δaction, t, :) .= current_action_grad_view .+ Δaction_t # Assuming compatible types
+            end
+
+            # Reset gradient accumulation (likely always zero/nothing)
+            if !isnothing(Δreset_t) && !isa(Δreset_t, ZeroTangent)
+                 current_reset_grad_view = view(Δreset, t, :)
+                 view(Δreset, t, :) .= current_reset_grad_view .+ Δreset_t # Add if non-zero grad exists
+            end
+
+            # Accumulate parameter gradients (already casted)
+            Δps = Zygote.accum(Δps, Δps_t) # Use Zygote.accum for safe addition
+
+            # Propagate carry gradient for the *next* iteration (t-1)
+            Δcarry_t_plus_1 = Δcarry_t # Already casted
+        end
+
+        # Return gradients for inputs of observe
+        return (ChainRulesCore.NO_FIELDS, Δcarry_accum, Δtokens, Δaction, Δreset, Δps, ChainRulesCore.DoesNotExist())
+    end
+
+    return (final_carry, final_entry, final_feat), observe_pullback
+end
+
+function _observe(rssm::RSSM, carry::NamedTuple, tokens::AbstractArray, action::AbstractVector{T}, reset::AbstractVector{B}, ps, st) where {T<:Integer, B<:Bool}
     # carry: NamedTuple with .deter and .stoch
     # tokens: Encoded observations, shape (token_dim, Batch) [Assuming single step for now]
     # action: Discrete action indices for the current step, shape (Batch,)
@@ -275,7 +454,7 @@ function _observe(rssm::RSSM, carry::NamedTuple, tokens, action::AbstractVector{
     logit_posterior, _ = rssm.observation.logit_posterior(x_posterior, ps.observation.logit_posterior, st.observation.logit_posterior)
     # 4d. Sample new stochastic state from posterior distribution
     dist_posterior = _dist(logit_posterior, rssm.unimix)
-    stoch_current = rand(rng, dist_posterior) # Assuming rng is available
+    stoch_current = Zygote.@ignore rand(rng, dist_posterior) # Assuming rng is available
 
     # --- 5. Prepare Outputs ---
     carry = (; deter=deter_current, stoch=stoch_current)
@@ -285,7 +464,7 @@ function _observe(rssm::RSSM, carry::NamedTuple, tokens, action::AbstractVector{
     @assert all(eltype(deter) == eltype(stoch) == eltype(logit_posterior)) "All variables must have the same element type"
 
     # Placeholder return
-    return carry, (entry, feat)
+    return carry, entry, feat
 end
 
 flat2group(x, g) = reshape(x, :, g, size(x, ndims(x))); # Use ndims for robustness
@@ -579,5 +758,3 @@ function entropy(d::OneHotDist)
 
     return entropy_final
 end
-
-

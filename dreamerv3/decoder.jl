@@ -89,7 +89,7 @@ function Decoder(;
         Dense(stoch_dim * classes_dim => 2units, act; init_weight=cast_glorot_uniform, init_bias=cast_zeros), # sp1 in python
         # Normalize along feature dim (dim 1), includes activation
         # Input/Output: (2*units, batch*seq)               # e.g. (16, 80)
-        RMSNorm((2units,), act; dims=(1,), init_scale=cast_ones), # sp1norm in python
+        RMSNorm((2units,), 1, act; dims=(1,), init_scale=cast_ones), # sp1norm in python
         # Dense layer transforms intermediate features into spatial features matching deter:
         # Input: (2*units, batch*seq)                      # e.g. (16, 80)
         # Output: (u, batch*seq)                           # e.g. (288, 80)
@@ -102,16 +102,16 @@ function Decoder(;
 
     # 3. Deconvolve the spatialized deter and stoch parts ---
     deconv_layers_list = []
-    # Restore original dims=(3,)
-    push!(deconv_layers_list, RMSNorm((c,), act; dims=(3,), init_scale=cast_ones)); # spnorm
+    println("DEBUG: Inside Decoder constructor, about to add first RMSNorm")
+    # FINAL ATTEMPT: Add feature_dim=3, keep dims=(3,) for channel norm
+    push!(deconv_layers_list, RMSNorm((c,), 3, act; dims=(3,), init_scale=cast_ones)); # spnorm
 
     current_channels = c
     for depth_out in reverse(depths[1:end-1])
-        # Keep Lux.Upsample
         push!(deconv_layers_list, Lux.Upsample(:nearest; scale=(2, 2, 1, 1)))
         push!(deconv_layers_list, Conv((kernel, kernel), current_channels => depth_out; pad=SamePad(), init_weight=cast_glorot_uniform, init_bias=cast_zeros))
-        # Restore original dims=(3,)
-        push!(deconv_layers_list, RMSNorm((depth_out,), act; dims=(3,), init_scale=cast_ones))
+        # FINAL ATTEMPT: Add feature_dim=3, keep dims=(3,) for channel norm
+        push!(deconv_layers_list, RMSNorm((depth_out,), 3, act; dims=(3,), init_scale=cast_ones))
         current_channels = depth_out
     end
 
