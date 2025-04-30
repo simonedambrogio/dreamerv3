@@ -1,5 +1,5 @@
 using Test, Random, Lux, Zygote, NNlib, BFloat16s, YAML, Statistics, 
-ChainRulesCore, OneHotArrays, SliceMap
+ChainRulesCore, OneHotArrays, SliceMap, Enzyme
 
 const ANSI_GREEN = "\e[32m"
 const ANSI_BLUE = "\e[34m"
@@ -15,7 +15,9 @@ include("../embodied/lux/nets.jl"); # Defines COMPUTE_TYPE and cast
 include("../dreamerv3/encoder.jl");
 include("../dreamerv3/agents.jl");
 
-test = 4;
+# --- Override COMPUTE_TYPE for Enzyme testing ---
+# const COMPUTE_TYPE = Float32
+println(ANSI_ORANGE, "Overriding COMPUTE_TYPE to Float32 for Enzyme test.", ANSI_RESET)
 
 # --- Define RSSM struct ---
 begin
@@ -206,7 +208,7 @@ begin
         # Use LuxCore.initialstates to get states for any potential stateful sub-layers later
         # For now, the state only contains the carry-over tensors.
         # --- Restore NamedTuple return ---
-        return (; deter = deter_init, stoch = stoch_init)
+        return (; deter = deter_init, stoch = stoch_init) 
     end
 
     function observe(rssm::RSSM, carry, tokens, action, reset, ps, st)
@@ -543,325 +545,144 @@ end
 
 # Inputs -------------------
 begin
-
-# --- Configuration & Setup ---
-config = YAML.load_file("dreamerv3/configs.yaml");
-
-# Define compute type (should match nets.jl)
-@assert COMPUTE_TYPE == BFloat16 # Ensure consistency
-
-rng = Random.default_rng();
-Random.seed!(rng, 0);
-
-B = batch_size = config["debug"]["batch_size"];
-T = seq_length = config["debug"]["batch_length"];
-obs = Tools.Space(UInt8, (96, 96, 1));
-depth = config["debug"]["agent"][".*\\.depth"];
-units = config["debug"]["agent"][".*\\.units"];
-deter_dim = config["debug"]["agent"][".*\\.deter"];
-stoch_dim = config["debug"]["agent"][".*\\.stoch"];
-classes_dim = config["debug"]["agent"][".*\\.classes"];
-hidden_dim = config["debug"]["agent"][".*\\.hidden"];
-blocks = config["debug"]["agent"][".*\\.blocks"];
-
-
-
-act=gelu;
-mults=config["defaults"]["agent"]["enc"]["simple"]["mults"];
-kernel=config["defaults"]["agent"]["enc"]["simple"]["kernel"];
-
-rng = Random.default_rng();
-
-println(ANSI_GREEN, "\n----- Running Encoder Forward Pass -----", ANSI_RESET)
-enc = Encoder(; obs, act, mults, depth, kernel);
-ps, st = Lux.setup(rng, enc);
-dummy_image = rand(rng, UInt8, obs.size..., T, B);
-dummy_obs = (; image = dummy_image); # Use NamedTuple matching encoder input
-println("  - Input shape: ", size(dummy_obs[:image]), "     -> (W, H, C, T, B)")
-tokens, st_new = enc(dummy_obs, ps, st);
-println("  - Output shape: ", size(tokens),         "          -> (token_dim, T, B)")
-
-act_space = Tools.Space(Int32, low=0, high=18);
-
-# RSSM
-rssm_config = make_config("dyn", "debug");
-rssm = RSSM(
-    deter_dim=rssm_config["deter"],
-    hidden_dim=rssm_config["hidden"],
-    stoch_dim=rssm_config["stoch"],
-    classes_dim=rssm_config["classes"],
-    blocks=rssm_config["blocks"],
-    token_dim=size(tokens,1), # Get from encoder
-    act_space=act_space
-);
-
-# Parameters and State
-ps_enc, st_enc = Lux.setup(rng, enc);
-ps_rssm, st_rssm = Lux.setup(rng, rssm);
-ps = (; encoder=ps_enc, rssm=ps_rssm);
-st = (; encoder=st_enc, rssm=st_rssm);
-
-# Convert parameters to COMPUTE_TYPE (BFloat16)
-ps = Lux.fmap(x -> x isa AbstractArray ? COMPUTE_TYPE.(x) : x, ps);
-
-println("  - Models Initialized")
-
-# --- Dummy Data Generation ---
-
-# Observation (example: image)
-obs_shape = (96, 96, 1, T, B);
-obs_image = rand(UInt8, obs_shape);
-obs = (; image = obs_image);
-
-# Actions (discrete, 0 to num_actions-1)
-# Action shape: (T, B)
-seq_actions = rand(rng, act_space.low:act_space.high, T, B);
-
-# Resets (boolean)
-# Reset shape: (T, B)
-seq_resets = rand(rng, Bool, T, B);
-
-println("  - Dummy Data Generated")
-
-# --- Encoder Forward Pass --- 
-# Convert obs to Float32 for encoder input processing like Python version
-tokens, _ = enc(dummy_obs, ps.encoder, st.encoder);
-
-println("  - Encoder Pass Completed. Token shape: ", size(tokens))
-
-# --- Initial Carry State --- 
-carry_init = initial_carry(rssm, B);
-println("  - Initial Carry Generated. Deter: ", size(carry_init.deter), ", Stoch: ", size(carry_init.stoch));
+    
+    # --- Configuration & Setup ---
+    config = YAML.load_file("dreamerv3/configs.yaml");
+    
+    # Define compute type (should match nets.jl)
+    # @assert COMPUTE_TYPE == BFloat16 # Ensure consistency
+    
+    rng = Random.default_rng();
+    Random.seed!(rng, 0);
+    
+    B = batch_size = config["debug"]["batch_size"];
+    T = seq_length = config["debug"]["batch_length"];
+    obs = Tools.Space(UInt8, (96, 96, 1));
+    depth = config["debug"]["agent"][".*\\.depth"];
+    units = config["debug"]["agent"][".*\\.units"];
+    deter_dim = config["debug"]["agent"][".*\\.deter"];
+    stoch_dim = config["debug"]["agent"][".*\\.stoch"];
+    classes_dim = config["debug"]["agent"][".*\\.classes"];
+    hidden_dim = config["debug"]["agent"][".*\\.hidden"];
+    blocks = config["debug"]["agent"][".*\\.blocks"];
+    
+    
+    
+    act=gelu;
+    mults=config["defaults"]["agent"]["enc"]["simple"]["mults"];
+    kernel=config["defaults"]["agent"]["enc"]["simple"]["kernel"];
+    
+    rng = Random.default_rng();
+    
+    println(ANSI_GREEN, "\n----- Running Encoder Forward Pass -----", ANSI_RESET)
+    enc = Encoder(; obs, act, mults, depth, kernel);
+    ps, st = Lux.setup(rng, enc);
+    dummy_image = rand(rng, UInt8, obs.size..., T, B);
+    dummy_obs = (; image = dummy_image); # Use NamedTuple matching encoder input
+    println("  - Input shape: ", size(dummy_obs[:image]), "     -> (W, H, C, T, B)")
+    tokens, st_new = enc(dummy_obs, ps, st);
+    println("  - Output shape: ", size(tokens),         "          -> (token_dim, T, B)")
+    
+    act_space = Tools.Space(Int32, low=0, high=18);
+    
+    # RSSM
+    rssm_config = make_config("dyn", "debug");
+    rssm = RSSM(
+        deter_dim=rssm_config["deter"],
+        hidden_dim=rssm_config["hidden"],
+        stoch_dim=rssm_config["stoch"],
+        classes_dim=rssm_config["classes"],
+        blocks=rssm_config["blocks"],
+        token_dim=size(tokens,1), # Get from encoder
+        act_space=act_space
+    );
+    
+    # Parameters and State
+    ps_enc, st_enc = Lux.setup(rng, enc);
+    ps_rssm, st_rssm = Lux.setup(rng, rssm);
+    ps = (; encoder=ps_enc, rssm=ps_rssm);
+    st = (; encoder=st_enc, rssm=st_rssm);
+    
+    # Convert parameters to COMPUTE_TYPE (BFloat16)
+    ps = Lux.fmap(x -> x isa AbstractArray ? COMPUTE_TYPE.(x) : x, ps);
+    
+    println("  - Models Initialized")
+    
+    # --- Dummy Data Generation ---
+    
+    # Observation (example: image)
+    obs_shape = (96, 96, 1, T, B);
+    obs_image = rand(UInt8, obs_shape);
+    obs = (; image = obs_image);
+    
+    # Actions (discrete, 0 to num_actions-1)
+    # Action shape: (T, B)
+    seq_actions = rand(rng, act_space.low:act_space.high, T, B);
+    
+    # Resets (boolean)
+    # Reset shape: (T, B)
+    seq_resets = rand(rng, Bool, T, B);
+    
+    println("  - Dummy Data Generated")
+    
+    # --- Encoder Forward Pass --- 
+    # Convert obs to Float32 for encoder input processing like Python version
+    tokens, _ = enc(dummy_obs, ps.encoder, st.encoder);
+    
+    println("  - Encoder Pass Completed. Token shape: ", size(tokens))
+    
+    # --- Initial Carry State --- 
+    carry_init = initial_carry(rssm, B);
+    println("  - Initial Carry Generated. Deter: ", size(carry_init.deter), ", Stoch: ", size(carry_init.stoch));
 end
 
-# --- Simple single-step objective (verified working) ---
-test == 1 && begin
-    function simplified_onestep_observe_objective(model::RSSM, carry, tkns_t, acts_t, rsts_t, p, s)
-        println("    - Entering simplified_onestep_observe_objective...")
-        final_carry, final_entry, final_feat = _observe(model, carry, tkns_t, acts_t, rsts_t, p, s) 
-        println("    - _observe() completed. Final Deter shape: ", size(final_entry.deter))
-    objective_value = sum(final_entry.deter) # Simple scalar objective
-    println("    - Calculated objective value: ", objective_value)
-    return objective_value
-    end;
-    
-    println("--- Running Single-Step Gradient Test ---")
-    action_t1 = view(seq_actions, 1, :);
-    reset_t1 = view(seq_resets, 1, :);
-    tokens_t1 = view(tokens, :, 1, :);
-    simplified_onestep_observe_objective(rssm, carry_init, tokens_t1, action_t1, reset_t1, ps.rssm, st.rssm);
-    val_1step, grads_1step = Zygote.withgradient(simplified_onestep_observe_objective, rssm, carry_init, tokens_t1, action_t1, reset_t1, ps.rssm, st.rssm);
-    println("  - Single-step Val: ", val_1step, ", Grads: ", !isnothing(grads_1step[6])); # Check if param grads exist
+
+
+function observe_objective(rssm::RSSM, carry, tokens, action, reset, ps, st)
+    _, _, final_feat = observe(rssm, carry, tokens, action, reset, ps, st)
+    return sum(final_feat.logit)
+end
+observe_objective(rssm, carry_init, tokens, seq_actions, seq_resets, ps.rssm, st.rssm)
+
+# --- Enzyme Test ---
+println("\n" * ANSI_VIOLET * "--- Running Enzyme Gradient Test ---" * ANSI_RESET)
+
+# 1. Define the objective function (using the original mutating observe)
+function enzyme_observe_objective(p_rssm, model, carry, tkns, acts, rsts, s)
+    _, _, final_feat = observe(model, carry, tkns, acts, rsts, p_rssm, s)
+    return sum(final_feat.logit)
 end
 
-# --- Minimal two-step objective --- 
-test == 2 && begin
-    function simplified_two_step_objective(model::RSSM, carry0::NamedTuple, tkns, acts, rsts, p, s) # Use NamedTuple carry0
-        println("    - Entering simplified_two_step_objective...")
-        
-        # Step 1
-        tkns_t1 = view(tkns, :, 1, :)
-        acts_t1 = view(acts, 1, :)
-        rsts_t1 = view(rsts, 1, :)
-        carry1, entry1, feat1 = _observe(model, carry0, tkns_t1, acts_t1, rsts_t1, p, s)
-        println("      - Step 1 deter shape: ", size(entry1.deter))
-    
-        # Step 2
-        tkns_t2 = view(tkns, :, 2, :)
-        acts_t2 = view(acts, 2, :)
-        rsts_t2 = view(rsts, 2, :)
-        carry2, entry2, feat2 = _observe(model, carry1, tkns_t2, acts_t2, rsts_t2, p, s) # Use carry1 (NamedTuple) from step 1
-        println("      - Step 2 deter shape: ", size(entry2.deter))
-    
-        # Objective: Sum of deter states from both steps
-        objective_value = sum(entry1.deter) + sum(entry2.deter)
-        println("    - Calculated two-step objective value: ", objective_value)
-        return objective_value
-    end
+# 2. Allocate gradient buffer
+# Use fmap to create a structure mirroring ps.rssm filled with zeros of the correct type
+Δps_rssm_enzyme = Lux.fmap(zero, ps.rssm);
 
-    println("--- Running Minimal Two-Step Gradient Test ---")
-    # model, carry0, tkns, acts, rsts, p, s = rssm, carry_init, tokens, seq_actions, seq_resets, ps.rssm, st.rssm
-    simplified_two_step_objective(rssm, carry_init, tokens, seq_actions, seq_resets, ps.rssm, st.rssm)
-    val_2step, grads_2step = Zygote.withgradient(simplified_two_step_objective, rssm, carry_init, tokens, seq_actions, seq_resets, ps.rssm, st.rssm)
-    println("  - Two-step Val: ", val_2step, ", Grads: ", !isnothing(grads_2step[6])) # Check if param grads exist
-    
-    println("--- Running Minimal Two-Step Gradient Test with iterative approach ---")
+# 3. Create closure for Enzyme
+# Closure captures variables like rssm, carry_init, etc.
+# It only takes the parameters (p_rssm) as the argument Enzyme will differentiate w.r.t.
+closure = (p) -> enzyme_observe_objective(p, rssm, carry_init, tokens, seq_actions, seq_resets, st.rssm)
+
+# 4. Run Enzyme.gradient!
+try
+    println("  - Calling Enzyme.gradient!...")
+    # Use Duplicated for the parameters ps.rssm to get gradients back in Δps_rssm_enzyme
+    # Use Const for other arguments that we don't need gradients for
+    Enzyme.autodiff(
+        Enzyme.set_runtime_activity(Enzyme.Reverse), # <-- Enable runtime activity
+        closure,
+        Enzyme.Active, # Mark the closure output (scalar sum) as Active
+        Enzyme.Duplicated(ps.rssm, Δps_rssm_enzyme) # Mark params as Duplicated
+    )
+    # Check if gradients were computed (example: check one parameter's gradient)
+    grad_example = Δps_rssm_enzyme.core.layer_deter.layers.layer_1.weight
+    has_grads = !all(iszero, grad_example)
+    println(ANSI_GREEN * "  - Enzyme.gradient! completed." * ANSI_RESET)
+    println("  - Enzyme Grads computed: ", has_grads)
+    # You could add more checks here, e.g., summing all elements in Δps_rssm_enzyme
+    # total_grad_sum = sum(sum(abs.(p)) for p in Lux.functor(Δps_rssm_enzyme)[1] if p isa AbstractArray)
+    # println("  - Total absolute gradient sum: ", total_grad_sum)
+catch e
+    println(ANSI_ORANGE * "  - Enzyme.gradient! failed:" * ANSI_RESET)
+    showerror(stdout, e)
+    println()
 end
-
-# --- Test 3: iterative sum objective --- 
-test == 3 && begin
-    println("--- Test Script Finished ---") 
-    model, carry0, tkns, acts, rsts, p, s = rssm, carry_init, tokens, seq_actions, seq_resets, ps.rssm, st.rssm
-    function simplified_two_step_array_comprehension_objective(model::RSSM, carry0::NamedTuple, tkns, acts, rsts, p, s) # Use NamedTuple carry0
-        println("    - Entering simplified_two_step_array_comprehension_objective...")
-        
-        array_comprehension = [
-            _observe(model, carry0, tkns_t1, acts_t1, rsts_t1, p, s)
-            for (tkns_t1, acts_t1, rsts_t1) in zip(eachslice(tkns, dims=2), eachslice(acts, dims=1), eachslice(rsts, dims=1))
-        ];
-        
-        objective_value = sum( sum(step_t[2].deter) for step_t in  array_comprehension);
-        
-        return objective_value
-    end
-
-    val_3step, grads_3step = Zygote.withgradient(simplified_two_step_array_comprehension_objective, rssm, carry_init, tokens[:, 1:2, :], seq_actions[1:2, :], seq_resets[1:2, :], ps.rssm, st.rssm)
-end
-
-# --- Test iterative sum objective with rrule (revised closure) --- 
-# carry, tokens, action, reset, ps, st = carry_init, tokens[:, 1:2, :], seq_actions[1:2, :], seq_resets[1:2, :], ps.rssm, st.rssm
-# 1. Iterative function remains the same (calculates sum and history)
-function observe_iterative_sum(rssm::RSSM, carry, tokens, action, reset, ps, st)
-    T = size(tokens, 2)
-    current_carry = carry
-    total_deter_sum = zero(eltype(carry.deter)) # Initialize sum
-    
-    # --- Store history for pullback --- 
-    carries_history = Vector{typeof(carry)}(undef, T + 1)
-    observe_pullbacks = Vector{Any}(undef, T) 
-    entry_deter_shapes = Vector{Any}(undef, T) 
-    carries_history[1] = current_carry
-    
-    for t in 1:T
-        tokens_t = view(tokens, :, t, :)
-        action_t = view(action, t, :)
-        reset_t = view(reset, t, :)
-
-        # Get the pullback for _observe along with the result
-        (carry_next, entry_t, feat_t), pb_observe = Zygote.pullback(_observe, rssm, current_carry, tokens_t, action_t, reset_t, ps, st)
-        observe_pullbacks[t] = pb_observe
-        entry_deter_shapes[t] = size(entry_t.deter) # Store shape
-        
-        # Accumulate sum
-        total_deter_sum += sum(entry_t.deter)
-        
-        current_carry = carry_next
-        carries_history[t+1] = current_carry 
-    end
-
-    final_carry = current_carry
-    # Package history needed for pullback
-    history = (; carries_history, observe_pullbacks, entry_deter_shapes, T = T, el_type = eltype(carry.deter), 
-                 # Also need original inputs shapes/types for grad init
-                 original_carry_type = typeof(carry),
-                 original_tokens_type = typeof(tokens),
-                 original_action_type = typeof(action),
-                 original_reset_type = typeof(reset),
-                 original_ps_type = typeof(ps),
-                 original_st_type = typeof(st))
-    
-    return (final_carry, total_deter_sum), history 
-end
-
-# 2. Define rrule for observe_iterative_sum
-import ChainRulesCore: rrule, NoTangent, ZeroTangent, @thunk
-import Lux # For recursive_add!!
-using Functors: fmap # Needed for zero initialization
-
-# Define a context object to hold history for the pullback
-struct ObserveIterativeSumPullbackContext{H}
-    history::H
-end
-
-function ChainRulesCore.rrule(::typeof(observe_iterative_sum), rssm, carry, tokens, action, reset, ps, st)
-    # Run forward pass and get history context
-    (final_carry, total_deter_sum), history_data = observe_iterative_sum(rssm, carry, tokens, action, reset, ps, st)
-    outputs = (final_carry, total_deter_sum)
-    ctx = ObserveIterativeSumPullbackContext(history_data) # Create context object
-    return outputs, ctx # Return context object instead of raw pullback closure
-end
-
-# Define the pullback method using the context object
-function (ctx::ObserveIterativeSumPullbackContext)(Δoutputs)
-    # Extract history and other needed info from context
-    history = ctx.history
-    carries_history = history.carries_history
-    observe_pullbacks = history.observe_pullbacks
-    entry_deter_shapes = history.entry_deter_shapes
-    T = history.T
-    el_type = history.el_type
-    # Get types/shapes for grad init from history
-    initial_carry = history.original_carry_type() # Need an instance for fmap
-    initial_tokens = history.original_tokens_type() # Need an instance for size
-    initial_action = history.original_action_type()
-    initial_reset = history.original_reset_type()
-    initial_ps = history.original_ps_type()
-    initial_st = history.original_st_type()
-    
-    # Initialize gradients using zeros/fmap/ZeroTangent
-    Δrssm = ZeroTangent() # No gradient wrt model struct itself
-    Δcarry_accum = fmap(zero, initial_carry) # Zero grads matching carry structure
-    Δtokens = zeros(el_type, size(initial_tokens))
-    Δaction = zeros(el_type, size(initial_action))
-    Δreset = zeros(el_type, size(initial_reset)) # Or ZeroTangent if non-numeric/not needed
-    Δps = fmap(zero, initial_ps) # Zero grads matching ps structure
-    Δst = fmap(zero, initial_st) # Zero grads matching st structure (careful with non-numerics)
-
-    # --- Backward Loop (BPTT) --- 
-    # Gradient flowing back through the carry state
-    Δcarry_t_plus_1 = fmap(zero, initial_carry) # Initialize with zeros matching structure
-    if !isnothing(Δfinal_carry) && Δfinal_carry != ZeroTangent()
-         # Accumulate using Zygote.accum
-         Δcarry_t_plus_1 = Zygote.accum(Δcarry_t_plus_1, Δfinal_carry)
-    end
-
-    for t in T:-1:1
-        @show t # <<< Add show
-        # Construct gradient for _observe outputs at step t
-        Δentry_t_deter = fill(Δtotal_deter_sum, entry_deter_shapes[t])
-        @show typeof(Δentry_t_deter), size(Δentry_t_deter) # <<< Add show
-        Δentry_t = (; deter=Δentry_t_deter, stoch=ZeroTangent()) 
-        Δfeat_t = ZeroTangent() 
-        @show typeof(Δcarry_t_plus_1) # <<< Add show
-        @show typeof(Δentry_t) # <<< Add show
-
-        Δobserve_outputs_t = (Δcarry_t_plus_1, Δentry_t, Δfeat_t)
-        @show typeof(Δobserve_outputs_t) # <<< Add show
-
-        # Call the pullback for _observe(t)
-        pb_observe_t = observe_pullbacks[t]
-        grads_observe_t = pb_observe_t(Δobserve_outputs_t)
-        @show typeof(grads_observe_t) # <<< Add show
-        _, Δrssm_t, Δcarry_t, Δtokens_t, Δaction_t, Δreset_t, Δps_t, Δst_t = grads_observe_t
-        @show typeof(Δps_t) # <<< Add show
-        @show typeof(Δcarry_t) # <<< Add show
-
-        # Accumulate gradients using Zygote.accum and broadcasted addition
-        Δrssm = Zygote.accum(Δrssm, Δrssm_t) # Should remain ZeroTangent unless rssm has params
-        Δps = Zygote.accum(Δps, Δps_t)
-        Δst = Zygote.accum(Δst, Δst_t) # Be careful if st has non-numeric fields
-        view(Δtokens, :, t, :) .+= Δtokens_t # Use broadcasted addition
-        view(Δaction, t, :) .+= Δaction_t   # Use broadcasted addition
-        if !isnothing(Δreset_t) && Δreset_t != ZeroTangent()
-            view(Δreset, t, :) .+= Δreset_t # Use broadcasted addition
-        end
-        
-        Δcarry_t_plus_1 = Δcarry_t 
-    end
-        
-    # Accumulate final carry gradient
-    Δcarry_accum = Zygote.accum(Δcarry_accum, Δcarry_t_plus_1)
-
-    return (NoTangent(), Δrssm, Δcarry_accum, Δtokens, Δaction, Δreset, Δps, Δst)
-end
-
-# 3. Define objective function using the iterative sum function
-function simplified_iterative_sum_objective(model::RSSM, carry, tkns, acts, rsts, p, s)
-    println("    - Entering simplified_iterative_sum_objective...")
-    
-    # Run forward pass, but only keep the total_sum for the objective
-    (_, total_sum), _ = observe_iterative_sum(model, carry, tkns, acts, rsts, p, s) # Ignore final_carry and history
-    
-    # Print component sizes of final_carry (Removed as final_carry is ignored)
-    # println("    - Final carry deter shape: ", size(final_carry.deter))
-    println("    - Calculated total iterative sum objective value: ", total_sum)
-    
-    # Return only the scalar sum
-    return total_sum 
-end
-
-println("--- Running Iterative Sum + rrule Gradient Test ---")
-simplified_iterative_sum_objective(rssm, carry_init, tokens[:, 1:2, :], seq_actions[1:2, :], seq_resets[1:2, :], ps.rssm, st.rssm)
-val_iterative_sum, grads_iterative_sum = Zygote.withgradient(simplified_iterative_sum_objective, rssm, carry_init, tokens[:, 1:2, :], seq_actions[1:2, :], seq_resets[1:2, :], ps.rssm, st.rssm)
-println("  - Iterative Sum Val: ", val_iterative_sum, ", Grads: ", !isnothing(grads_iterative_sum[6])) # Check if param grads exist
-

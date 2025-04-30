@@ -1,11 +1,9 @@
+using Lux, NNlib, Random
 using BFloat16s
 using ChainRulesCore # Need this for ZeroTangent, Tangent
 
-# Define COMPUTE_TYPE globally if not already defined elsewhere
-# If it's defined in another central place, remove this.
-if !@isdefined(COMPUTE_TYPE)
-    const COMPUTE_TYPE = BFloat16
-end
+# Define the compute type globally
+const COMPUTE_TYPE = BFloat16 # Changed back from Float32
 
 function cast(x::Number)
     if x isa COMPUTE_TYPE
