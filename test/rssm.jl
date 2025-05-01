@@ -63,7 +63,8 @@ println(ANSI_GREEN, "\n----- Testing Loss Calculation -----", ANSI_RESET)
 action = [Int16(Tools.sample(act_space)) for _ in 1:T, _ in 1:B];
 reset = rand(rng, Bool, T, B);
 
-false && begin
+test_inner_rssm = false
+test_inner_rssm && begin
     
     # loss_carry, loss_entry, loss_losses, loss_feat, loss_metrics =  loss(rssm, carry, tokens, action, reset, ps, st)    
     carry, entry, feat = observe(rssm, carry, tokens, action, reset, ps, st);

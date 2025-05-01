@@ -2,7 +2,7 @@ using Test, Random, Lux, Zygote, NNlib, BFloat16s, YAML, Statistics,
 ChainRulesCore, OneHotArrays, SliceMap
 using StatsBase: Weights # Added for sampling
 using OneHotArrays: onehot # Added for encoding 
-using Zygote: @ignore
+using Zygote: Buffer, @ignore # Import Buffer
 
 # --- Workaround for AbstractRecurrentCell TypeError ---
 # ------------------------------------------------------
@@ -21,7 +21,7 @@ include("../embodied/lux/nets.jl"); # Defines COMPUTE_TYPE and cast
 include("../dreamerv3/encoder.jl");
 include("../dreamerv3/agents.jl");
 
-test = 3
+test = 5
 # --- Define RSSM struct ---
 begin
     # Based on Python RSSM class attributes
@@ -169,7 +169,69 @@ begin
                     token_dim, act_space, core_layers, observation_layers, imagination_layers)
     end
     
+    # --- ObserveCell Definition (Moved Inside) ---
+    println("Type of Lux.AbstractRecurrentCell just before definition: ", typeof(Lux.AbstractRecurrentCell))
+    struct ObserveCell <: Lux.AbstractRecurrentCell
+        rssm::RSSM
+    end
+    # Parameters are those of the underlying RSSM
+    Lux.initialparameters(rng::AbstractRNG, cell::ObserveCell) = Lux.initialparameters(rng, cell.rssm)
+    # State is that of the underlying RSSM's components
+    Lux.initialstates(rng::AbstractRNG, cell::ObserveCell) = Lux.initialstates(rng, cell.rssm)
     
+    struct DynInput
+        tokens::AbstractArray
+        action::AbstractArray
+        reset::AbstractArray
+    end
+    
+    function (cell::ObserveCell)((x, carry)::Tuple, ps_rssm::NamedTuple, st_rssm::NamedTuple)
+        carry_next, entry_t, feat_t = _observe(cell.rssm, carry, x.tokens, x.action, x.reset, ps_rssm, st_rssm)
+        return ((entry_t, feat_t), carry_next), st_rssm # Pass st_rssm through unchanged
+    end
+    
+    function (cell::ObserveCell)(x::DynInput, ps_rssm::NamedTuple, st_rssm::NamedTuple)
+        batch_size = size(x.tokens, 2)
+        carry = initial_carry(cell.rssm, batch_size)
+        carry_next, entry_t, feat_t = _observe(cell.rssm, carry, x.tokens, x.action, x.reset, ps_rssm, st_rssm)
+        return ((entry_t, feat_t), carry_next), st_rssm # Pass st_rssm through unchanged
+    end
+    
+    function StatefulRSSM(;
+            deter_dim::Int = 4096,
+            hidden_dim::Int = 2048,
+            stoch_dim::Int = 32,
+            classes_dim::Int = 32,
+            act::Function = gelu,
+            unimix::Float32 = 0.01f0,
+            imglayers::Int = 2,
+            obslayers::Int = 1,
+            dynlayers::Int = 1,
+            blocks::Int = 8,
+            free_nats::Float32 = 1.0f0,
+            token_dim::Int,        # Added token_dim (mandatory)
+            act_space::Space
+        )
+        rssm = RSSM(;
+            deter_dim,
+            hidden_dim,
+            stoch_dim,
+            classes_dim,
+            act,
+            unimix,
+            imglayers,
+            obslayers,
+            dynlayers,
+            blocks,
+            free_nats,
+            token_dim,
+            act_space
+        )
+
+        l = ObserveCell(rssm);
+        recurrent_observe = StatefulRecurrentCell(l);
+        return recurrent_observe
+    end
     """
         initial_state(rssm::RSSM, batch_size::Int, ::AbstractRNG)
     
@@ -306,7 +368,8 @@ begin
     
         # Check types before returning the original tuples
         @assert all(eltype(deter_current) == eltype(stoch_current) == eltype(logit_posterior)) "All variables must have the same element type"
-    
+        
+        # println("entry_out.stoch: ", size(entry_out.stoch))
         # Return the original tuples
         return carry_out, entry_out, feat_out
     end
@@ -398,34 +461,7 @@ begin
         # Note: Might need to return updated state if layers become stateful
         return prior_logits_seq
     end
-    # --- ObserveCell Definition (Moved Inside) ---
-    println("Type of Lux.AbstractRecurrentCell just before definition: ", typeof(Lux.AbstractRecurrentCell))
-    struct ObserveCell <: Lux.AbstractRecurrentCell
-        rssm::RSSM
-    end
-    # Parameters are those of the underlying RSSM
-    Lux.initialparameters(rng::AbstractRNG, cell::ObserveCell) = Lux.initialparameters(rng, cell.rssm)
-    # State is that of the underlying RSSM's components
-    Lux.initialstates(rng::AbstractRNG, cell::ObserveCell) = Lux.initialstates(rng, cell.rssm)
 end;
-
-struct DynInput
-    tokens::AbstractArray
-    action::AbstractArray
-    reset::AbstractArray
-end
-
-function (cell::ObserveCell)((x, carry)::Tuple, ps_rssm::NamedTuple, st_rssm::NamedTuple)
-    carry_next, entry_t, feat_t = _observe(cell.rssm, carry, x.tokens, x.action, x.reset, ps_rssm, st_rssm)
-    return ((entry_t, feat_t), carry_next), st_rssm # Pass st_rssm through unchanged
-end
-
-function (cell::ObserveCell)(x::DynInput, ps_rssm::NamedTuple, st_rssm::NamedTuple)
-    batch_size = size(x.tokens, 3)
-    carry = initial_carry(cell.rssm, batch_size)
-    carry_next, entry_t, feat_t = _observe(cell.rssm, carry, x.tokens, x.action, x.reset, ps_rssm, st_rssm)
-    return ((entry_t, feat_t), carry_next), st_rssm # Pass st_rssm through unchanged
-end
 
 # Inputs -------------------
 begin
@@ -449,8 +485,6 @@ begin
     classes_dim = config["debug"]["agent"][".*\\.classes"];
     hidden_dim = config["debug"]["agent"][".*\\.hidden"];
     blocks = config["debug"]["agent"][".*\\.blocks"];
-    
-    
     
     act=gelu;
     mults=config["defaults"]["agent"]["enc"]["simple"]["mults"];
@@ -520,6 +554,7 @@ begin
     println("  - Initial Carry Generated. Deter: ", size(carry_init.deter), ", Stoch: ", size(carry_init.stoch));
 end
 
+
 test == 1 && begin
     println("--- Test Script Finished ---") 
     model, carry0, tkns, acts, rsts, p, s = rssm, carry_init, tokens, seq_actions, seq_resets, ps.rssm, st.rssm
@@ -538,7 +573,6 @@ test == 1 && begin
 
     val_3step, grads_3step = Zygote.withgradient(simplified_two_step_array_comprehension_objective, rssm, carry_init, tokens[:, 1:2, :], seq_actions[1:2, :], seq_resets[1:2, :], ps.rssm, st.rssm)
 end
-
 
 # --- Recurrence Test using StatefulRecurrentCell ---
 test == 2 && begin 
@@ -582,43 +616,231 @@ test == 2 && begin
     out, st = r(x, ps, st)
 end
 
-println("\n" * ANSI_GREEN * "--- Running Iterative Recurrent Objective Gradient Test ---" * ANSI_RESET)
+test == 3 && begin
+    println("\n" * ANSI_GREEN * "--- Running Iterative Recurrent Objective Gradient Test ---" * ANSI_RESET)
 
-# Define the objective function with proper iteration
-function recurrent_objective(r::StatefulRecurrentCell, x, ps, st)
-    # Determine the element type for accumulation based on the expected output type
-    el_type = eltype(x[1][1])
-    objective_value = zero(el_type)
-    # inputs_sequence should be like: [(tokens_1, action_1, reset_1), (tokens_2, ...), ...]
-    # x_t = x[2]
-    for x_t in x
-        out, st = r(DynInput(x_t...), ps, st)
-        objective_value += sum(out[1].deter)
+    # Define the objective function with proper iteration
+    function recurrent_objective(r::StatefulRecurrentCell, x, ps, st)
+        # Determine the element type for accumulation based on the expected output type
+        el_type = eltype(x[1][1])
+        objective_value = zero(el_type)
+        # inputs_sequence should be like: [(tokens_1, action_1, reset_1), (tokens_2, ...), ...]
+        # x_t = x[2]
+        for x_t in x
+            out, st = r(DynInput(x_t...), ps, st)
+            objective_value += sum(out[1].deter)
+        end
+
+        return objective_value
     end
 
-    return objective_value
+    # --- Prepare inputs for the objective ---
+    T_test = 2 # Use 2 steps like the array comprehension test for comparison
+    x = [
+        (view(tokens, :, t, :), view(seq_actions, t, :), view(seq_resets, t, :))
+        for t in 1:T_test
+    ];
+    println("  - Input sequence prepared. Length: ", length(x))
+
+
+    l = ObserveCell(rssm);
+    r = StatefulRecurrentCell(l);
+    ps, st = Lux.setup(rng, r);
+
+    # Wrap the objective call with Zygote.withgradient
+    # We want gradients w.r.t. ps (parameters)
+    println("  - Calling the objective function")
+    val, grads = Zygote.withgradient(recurrent_objective, r, x, ps, st)
+
+    println("  - Objective Value (StatefulRecurrentCell): ", val)
+
+    # Check the gradients object
+    grads_ps = grads[3] # Gradients are returned in a tuple matching args (r, x, ps, st)
+    println("  - Gradients w.r.t. Parameters (ps) exist: ", grads_ps !== nothing)
 end
 
-# --- Prepare inputs for the objective ---
-T_test = 2 # Use 2 steps like the array comprehension test for comparison
-x = [
-    (view(tokens, :, t, :), view(seq_actions, t, :), view(seq_resets, t, :))
-    for t in 1:T_test
-];
-println("  - Input sequence prepared. Length: ", length(x))
+test == 4 && begin
+    println("\n" * ANSI_ORANGE * "--- Running Iterative Recurrent Objective Gradient Test w/ Output Collection (Test 4) ---" * ANSI_ORANGE)
 
+    # Define the objective function with proper iteration and output collection
+    function recurrent_objective_collect(r::StatefulRecurrentCell, x_sequence, ps_cell, initial_st)
+        # Determine sequence length and element type
+        T = length(x_sequence)
+        el_type = eltype(x_sequence[1][1]) # Type from tokens
+
+        # Extract RSSM and dimensions needed for buffers
+        D = rssm.deter_dim
+        S = rssm.stoch_dim
+        C = rssm.classes_dim
+        B = size(x_sequence[1][1], 2)
+
+        objective_value = zero(el_type)
+
+        # Initialize Zygote Buffers
+        deter_buffer = Buffer(zeros(el_type, D, T, B))
+        logit_buffer = Buffer(zeros(el_type, S, C, T, B))
+        stoch_buffer = Buffer(zeros(el_type, S, C, T, B)) # Also collect stoch if needed
+
+        current_st = initial_st
+        println("    - Starting recurrent loop (T=$T)...")
+        for t in 1:T
+            x_t = x_sequence[t]
+
+            out, next_st = r(DynInput(x_t...), ps_cell, current_st)
+            entry_t, feat_t = out
+
+            objective_value += sum(entry_t.deter)
+
+            # Store results in buffers
+            deter_buffer[:, t, :] = entry_t.deter
+            stoch_buffer[:, :, t, :] = entry_t.stoch # Store stoch state
+            logit_buffer[:, :, t, :] = feat_t.logit
+
+            current_st = next_st
+        end
+        println("    - Finished recurrent loop.")
+
+        # Convert buffers to regular arrays
+        collected_deter = copy(deter_buffer)
+        collected_stoch = copy(stoch_buffer)
+        collected_logits = copy(logit_buffer)
+        println("    - Buffers copied to arrays.")
+
+        # Return objective, collected sequences, and final state
+        # Returning stoch state as well, as it might be useful
+        return objective_value, collected_deter, collected_stoch, collected_logits, current_st
+    end
+
+    # --- Prepare inputs for the objective ---
+    T_test = 2
+    x_t4 = [
+        (view(tokens, :, t, :), view(seq_actions, t, :), view(seq_resets, t, :))
+        for t in 1:T_test
+    ];
+    println("  - Input sequence prepared. Length: ", length(x_t4))
+
+    # --- Setup Model and State ---
+    l_t4 = ObserveCell(rssm);
+    r_t4 = StatefulRecurrentCell(l_t4);
+    ps_r_t4, st_r_t4 = Lux.setup(rng, r_t4);
+    ps_r_t4 = Lux.fmap(x -> x isa AbstractArray ? COMPUTE_TYPE.(x) : x, ps_r_t4);
+    println("  - Stateful Cell, Parameters, and State Initialized.")
+
+    # --- Run Zygote ---
+    println("  - Calling Zygote.withgradient...")
+    (val_t4, deter_coll, stoch_coll, logits_coll, final_st_t4), grads_t4 = Zygote.withgradient(
+        recurrent_objective_collect, # Use the collecting version
+        r_t4,       # The stateful recurrent cell
+        x_t4,       # Sequence of inputs
+        ps_r_t4,    # Parameters of the cell
+        st_r_t4     # Initial state of the cell
+    )
+    println("  - Zygote.withgradient finished.")
+
+    # --- Use collected outputs ---
+    println("  - Calculating Prior Logits using collected deter sequence...")
+    # Use parameters (ps_r_t4) and the *internal state* of the ObserveCell (st_r_t4.st)
+    prior_logits_t4 = _prior(rssm, deter_coll, ps_r_t4, st_r_t4.cell)
+    println("  - Prior Logits Calculated. Shape: ", size(prior_logits_t4)) # Shape: (S, C, T, B)
+    println("--- Iterative Recurrent Objective Test w/ Collection (Test 4) Finished ---")
+end
+
+
+function observe(recurrent_observe::StatefulRecurrentCell, tokens, action, reset, ps, st)
+    # seq_tokens shape: (token_dim, T, B)
+    # seq_actions shape: (T, B)
+    # seq_resets shape: (T, B)
+
+    T = size(tokens, 2) # Get sequence length
+    B = size(tokens, 3) # Get batch size
+    S, C = recurrent_observe.cell.rssm.stoch_dim, recurrent_observe.cell.rssm.classes_dim # Get stoch and classes dims
+    D = recurrent_observe.cell.rssm.deter_dim # Get deter dim
+
+    # --- Pre-allocate Output Arrays (Buffer Approach) ---
+    # Determine element type from carry (assuming consistency)
+    el_type = eltype(tokens)
+
+    # Allocate arrays to store the full sequences
+    # Shapes: (feature_dim, T, B) or (feature_dim1, feature_dim2, T, B)
+    # seq_deter_out = similar(tokens, el_type, rssm.deter_dim, T, B)
+    # Assuming entry.stoch and feat.logit have same shape structure as initial carry.stoch
+    # stoch_dims = size(carry.stoch)[1:end-1] # Get stoch dims excluding Batch
+    # seq_stoch_out = similar(tokens, el_type, stoch_dims..., T, B)
+    # seq_logit_out = similar(tokens, el_type, stoch_dims..., T, B)
+
+    seq_deter_out = Buffer(zeros(el_type, D, T, B))
+    seq_stoch_out = Buffer(zeros(el_type, S, C, T, B))
+    seq_logit_out = Buffer(zeros(el_type, S, C, T, B))
+
+    # --- Loop over time steps ---
+    for t in 1:T
+        # Get inputs for the current time step
+        tokens_t = view(tokens, :, t, :) # Shape: (token_dim, B)
+        action_t = view(action, t, :)   # Shape: (B,)
+        reset_t = view(reset, t, :)     # Shape: (B,)
+
+        out, st = recurrent_observe(DynInput(tokens_t, action_t, reset_t), ps, st);
+        entry_t, feat_t = out
+
+        
+        # Store results in buffers
+        seq_deter_out[:, t, :] = entry_t.deter
+        seq_stoch_out[:, :, t, :] = entry_t.stoch # Store stoch state
+        seq_logit_out[:, :, t, :] = feat_t.logit
+    end
+
+    # --- Prepare final outputs ---
+    # The pre-allocated arrays now hold the full sequences
+    final_feat = (; deter=copy(seq_deter_out), stoch=copy(seq_stoch_out), logit=copy(seq_logit_out))
+    final_entry = (; deter=copy(seq_deter_out), stoch=copy(seq_stoch_out))
+
+    return (final_entry, final_feat), st
+end
+
+function loss(recurrent_observe::StatefulRecurrentCell, tokens, action, reset, ps, st)
+
+    rssm = recurrent_observe.cell.rssm;
+    # Get the final feature output
+    (_, feat), st = observe(recurrent_observe, tokens, action, reset, ps, st);
+
+    # Prior and Posterior Distributions Logits
+    post_logits = feat.logit; # Shape: (S, C, T, B)
+    prior_logits = _prior(rssm, feat.deter, ps, st.cell); # Shape: (S, C, T, B)
+
+    # KL Divergence Losses
+    post_dist = _dist(post_logits, rssm.unimix);
+    prior_dist = _dist(prior_logits, rssm.unimix);
+
+    dyn_elementwise = kl_divergence(_dist(dropgrad(post_logits), rssm.unimix), prior_dist)
+    rep_elementwise = kl_divergence(post_dist, _dist(dropgrad(prior_logits), rssm.unimix))
+
+    # Apply free_nats clamp (Shape: S, T, B)
+    dyn_clamped = max.(dyn_elementwise, COMPUTE_TYPE(rssm.free_nats))
+    rep_clamped = max.(rep_elementwise, COMPUTE_TYPE(rssm.free_nats))
+
+    # Sum over stochastic dimension (dim=1) to match Agg behavior
+    dyn_summed = sum(dyn_clamped; dims=1) # Shape: (1, T, B)
+    rep_summed = sum(rep_clamped; dims=1) # Shape: (1, T, B)
+
+    dyn = dropdims(dyn_summed; dims=1)
+    rep = dropdims(rep_summed; dims=1)
+    # Store scalar losses (using NamedTuple for type stability)
+    losses = (; dyn = dyn, rep = rep)
+
+    return mean(losses.dyn) + mean(losses.rep)
+end
 
 l = ObserveCell(rssm);
-r = StatefulRecurrentCell(l);
-ps, st = Lux.setup(rng, r);
+recurrent_observe = StatefulRecurrentCell(l);
+ps, st = Lux.setup(rng, recurrent_observe);
+loss(recurrent_observe, tokens, seq_actions, seq_resets, ps, st)
 
-# Wrap the objective call with Zygote.withgradient
-# We want gradients w.r.t. ps (parameters)
-println("  - Calling the objective function")
-val, grads = Zygote.withgradient(recurrent_objective, r, x, ps, st)
-
-println("  - Objective Value (StatefulRecurrentCell): ", val)
-
-# Check the gradients object
-grads_ps = grads[3] # Gradients are returned in a tuple matching args (r, x, ps, st)
-println("  - Gradients w.r.t. Parameters (ps) exist: ", grads_ps !== nothing)
+val, grads = Zygote.withgradient(
+    loss,                # Use the collecting version
+    recurrent_observe,   # The stateful recurrent cell
+    tokens,              # Sequence of inputs
+    seq_actions,         # Parameters of the cell
+    seq_resets,          # Initial state of the cell
+    ps,
+    st
+)
