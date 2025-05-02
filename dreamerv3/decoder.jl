@@ -1,10 +1,4 @@
 using Lux, NNlib, Random, Tools, BFloat16s, YAML, Statistics, LuxCore
-# include("../embodied/lux/rms.jl");
-# include("../embodied/lux/nets.jl");
-# include("../embodied/lux/BlockLinear.jl");
-# include("../embodied/lux/ReArrange.jl");
-# include("../embodied/lux/UpSample.jl");
-config = YAML.load_file("dreamerv3/configs.yaml");
 
 struct Decoder{SD, SS, DC} <: Lux.AbstractLuxContainerLayer{(:spatialize_deter, :spatialize_stoch, :deconvolve)}
     act::Function
@@ -102,7 +96,7 @@ function Decoder(;
 
     # 3. Deconvolve the spatialized deter and stoch parts ---
     deconv_layers_list = []
-    println("DEBUG: Inside Decoder constructor, about to add first RMSNorm")
+    # println("DEBUG: Inside Decoder constructor, about to add first RMSNorm")
     # FINAL ATTEMPT: Add feature_dim=3, keep dims=(3,) for channel norm
     push!(deconv_layers_list, RMSNorm((c,), 3, act; dims=(3,), init_scale=cast_ones)); # spnorm
 
@@ -151,7 +145,7 @@ function (dec::Decoder)(feat, ps, st)
     input_decoder = out_deter + out_stoch;
 
     # 3. Deconvolve the combined input
-    out_deconv, st_deconv_new = dec.deconvolve(input_decoder, ps.deconvolve, st.deconvolve)
+    out_deconv, _ = dec.deconvolve(input_decoder, ps.deconvolve, st.deconvolve)
 
     # 4. Apply final activation (sigmoid)
     out_sigmoid = sigmoid.(out_deconv)

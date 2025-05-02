@@ -1,8 +1,9 @@
 using Lux, NNlib, Random, Tools, BFloat16s, YAML, Statistics, LuxCore
-# include("../embodied/lux/rms.jl");
-# include("../embodied/lux/nets.jl");
-# include("../embodied/lux/BlockLinear.jl");
-# include("../embodied/lux/ReArrange.jl");
+include("../embodied/lux/rms.jl");
+include("../embodied/lux/nets.jl");
+include("../embodied/lux/BlockLinear.jl");
+include("../embodied/lux/UpSample.jl");
+include("../embodied/lux/ReArrange.jl");
 
 struct Encoder{T} <: Lux.AbstractLuxContainerLayer{(:convolve,)}
     act::Function
@@ -136,7 +137,7 @@ function (enc::Encoder)(obs, ps, st)
     @assert typeof(imgs) == Array{UInt8, 4} "Image must be an array of UInt8"
     imgs = cast.(imgs) ./ cast(255) .- cast(0.5);
     
-    output, new_state = enc.convolve(imgs, ps.convolve, st.convolve);
+    output, _ = enc.convolve(imgs, ps.convolve, st.convolve);
 
     # Reshape the output to be a 3D array of size (embedding_dim, T, B)
     W, H, C, A = size(output);
@@ -144,7 +145,7 @@ function (enc::Encoder)(obs, ps, st)
     output = reshape(output, (WHC, A));
     output = reshape(output, (WHC, T, B))
 
-    return output, new_state
+    return output, st
 end;
 
 

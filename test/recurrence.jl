@@ -1,470 +1,16 @@
-using Test, Random, Lux, Zygote, NNlib, BFloat16s, YAML, Statistics, 
-ChainRulesCore, OneHotArrays, SliceMap
-using StatsBase: Weights # Added for sampling
-using OneHotArrays: onehot # Added for encoding 
-using Zygote: Buffer, @ignore # Import Buffer
+include("../dreamerv3/agents.jl");
 
-# --- Workaround for AbstractRecurrentCell TypeError ---
 # ------------------------------------------------------
 const ANSI_GREEN = "\e[32m"
 const ANSI_BLUE = "\e[34m"
 const ANSI_ORANGE = "\e[33m"
 const ANSI_VIOLET = "\e[35m"
 const ANSI_RESET = "\e[0m"
-
-
-# --- Include necessary components --- 
-include("../embodied/lux/BlockLinear.jl");
-include("../embodied/lux/ReArrange.jl");
-include("../embodied/lux/rms.jl");
-include("../embodied/lux/nets.jl"); # Defines COMPUTE_TYPE and cast
-include("../dreamerv3/encoder.jl");
-include("../dreamerv3/agents.jl");
-
-test = 5
-# --- Define RSSM struct ---
-begin
-    # Based on Python RSSM class attributes
-    struct RSSM{AS, CN, PO, OI} <: Lux.AbstractLuxContainerLayer{(:core, :observation, :imagination)} # Added AS for type stability
-        deter_dim::Int
-        hidden_dim::Int
-        stoch_dim::Int
-        classes_dim::Int
-        act::Function
-        unimix::Float32
-        imglayers::Int
-        obslayers::Int
-        dynlayers::Int
-        blocks::Int
-        free_nats::Float32
-        token_dim::Int  # Added token dimension
-        act_space::AS # Use type parameter AS
-        # Sub-layers defined in core
-        core::CN
-        observation::PO
-        imagination::OI
-    end
-    
-    function RSSM(; # Constructor
-        deter_dim::Int = 4096,
-        hidden_dim::Int = 2048,
-        stoch_dim::Int = 32,
-        classes_dim::Int = 32,
-        act::Function = gelu,
-        unimix::Float32 = 0.01f0,
-        imglayers::Int = 2,
-        obslayers::Int = 1,
-        dynlayers::Int = 1,
-        blocks::Int = 8,
-        free_nats::Float32 = 1.0f0,
-        token_dim::Int,        # Added token_dim (mandatory)
-        act_space::Space) # act_space is mandatory
-    
-        # --- Calculate Static Dimensions ---
-        g = blocks
-        @assert deter_dim % g == 0 "deter_dim must be divisible by blocks (g)"
-        @assert (stoch_dim * classes_dim) % g == 0 "stoch_dim*classes_dim must be divisible by blocks (g)" # Might need this if stoch is used in BlockLinear
-        @assert (3 * deter_dim) % g == 0 "3*deter_dim must be divisible by blocks (g)" # For gru_layer output
-        num_actions = act_space.high + 1 # Assuming discrete Space
-    
-        # --- Define Core Layers --- 
-    
-        # Layers for initial context processing (deter, stoch, action)
-        layer_deter = Chain(
-            Dense(deter_dim => hidden_dim; init_weight=cast_glorot_uniform, init_bias=cast_zeros),
-            RMSNorm((hidden_dim,), 1, act; dims=(1,), init_scale=cast_ones)
-        )
-        layer_stoch = Chain(
-            Dense(stoch_dim * classes_dim => hidden_dim; init_weight=cast_glorot_uniform, init_bias=cast_zeros),
-            RMSNorm((hidden_dim,), 1, act; dims=(1,), init_scale=cast_ones)
-        )
-        layer_action = Chain(
-            Dense(num_actions => hidden_dim; init_weight=cast_glorot_uniform, init_bias=cast_zeros),
-            RMSNorm((hidden_dim,), 1, act; dims=(1,), init_scale=cast_ones)
-        )
-    
-        # Dynamic layers loop (dynhid + dynhidnorm)
-        gru_layers_list = []
-        # Calculate input dim for the *first* dynamic layer
-        h_deter_per_block = deter_dim ÷ g
-        feat_concat_static = 3 * hidden_dim
-        first_dyn_input_dim = (h_deter_per_block + feat_concat_static) * g
-        current_dyn_input_dim = first_dyn_input_dim
-    
-        for _ in 1:dynlayers
-            push!(gru_layers_list, Chain(
-                BlockLinear(current_dyn_input_dim, deter_dim, g; init_weight=cast_glorot_uniform, init_bias=cast_zeros),
-                RMSNorm((deter_dim,), 1, act; dims=(1,), init_scale=cast_ones)
-            ))
-            current_dyn_input_dim = deter_dim # Input for subsequent layers is the output of the previous one
-        end
-        
-        # Final GRU layer (dyngru)
-        gru_layer_input_dim = deter_dim # Output of the dyn_layers loop
-        gru_layer_output_dim = 3 * deter_dim
-        gru_layer = BlockLinear(gru_layer_input_dim, gru_layer_output_dim, g; init_weight=cast_glorot_uniform, init_bias=cast_zeros)
-        push!(gru_layers_list, gru_layer)
-    
-        gru_layers = Chain(gru_layers_list...; name="gru_layers")
-    
-        # Posterior layers (obs + obsnorm)
-        posterior_layers_list = []
-        first_obs_input_dim = deter_dim + token_dim
-        current_obs_input_dim = first_obs_input_dim
-    
-        for _ in 1:obslayers # Use the obslayers field
-            push!(posterior_layers_list, Chain(
-                Dense(current_obs_input_dim => hidden_dim; init_weight=cast_glorot_uniform, init_bias=cast_zeros),
-                RMSNorm((hidden_dim,), 1, act; dims=(1,), init_scale=cast_ones)
-            ))
-            current_obs_input_dim = hidden_dim # Output of Norm is input to next Dense
-        end
-        posterior_layers = Chain(posterior_layers_list...; name="posterior_layers")
-    
-        # Prior layers
-        prior_layers_list = []
-        # Prior only depends on deter_dim
-        current_prior_input_dim = deter_dim 
-    
-        for _ in 1:imglayers # Use the imglayers field from RSSM struct
-            push!(prior_layers_list, Chain(
-                # Use current_prior_input_dim correctly
-                Dense(current_prior_input_dim => hidden_dim; init_weight=cast_glorot_uniform, init_bias=cast_zeros),
-                RMSNorm((hidden_dim,), 1, act; dims=(1,), init_scale=cast_ones)
-            ))
-            current_prior_input_dim = hidden_dim # Output of Norm is input to next Dense
-        end
-        prior_layers = Chain(prior_layers_list...; name="prior_layers")
-    
-        # Logit layers (Dense + Reshape)
-        logit_posterior = Chain(
-            Dense(hidden_dim => stoch_dim * classes_dim; init_weight=cast_glorot_uniform, init_bias=cast_zeros),
-            ReArrange((stoch_dim, classes_dim, :))
-        )
-        logit_prior = Chain(
-            Dense(hidden_dim => stoch_dim * classes_dim; init_weight=cast_glorot_uniform, init_bias=cast_zeros),
-            ReArrange((stoch_dim, classes_dim, :))
-        )
-    
-        # --- Store Layers in NamedTuple --- 
-        core_layers = (
-            layer_deter = layer_deter,
-            layer_stoch = layer_stoch,
-            layer_action = layer_action,
-            gru_layers = gru_layers
-        )
-        observation_layers = (
-            posterior_layers = posterior_layers,
-            logit_posterior = logit_posterior,
-        )
-        imagination_layers = (
-            prior_layers = prior_layers,
-            logit_prior = logit_prior
-        )
-    
-        # --- Return RSSM Instance --- 
-        # Automatically determine types AS, CN, PO
-        return RSSM(deter_dim, hidden_dim, stoch_dim, classes_dim, act, unimix, 
-                    imglayers, obslayers, dynlayers, blocks, free_nats, 
-                    token_dim, act_space, core_layers, observation_layers, imagination_layers)
-    end
-    
-    # --- ObserveCell Definition (Moved Inside) ---
-    println("Type of Lux.AbstractRecurrentCell just before definition: ", typeof(Lux.AbstractRecurrentCell))
-    struct ObserveCell <: Lux.AbstractRecurrentCell
-        rssm::RSSM
-    end
-    # Parameters are those of the underlying RSSM
-    Lux.initialparameters(rng::AbstractRNG, cell::ObserveCell) = Lux.initialparameters(rng, cell.rssm)
-    # State is that of the underlying RSSM's components
-    Lux.initialstates(rng::AbstractRNG, cell::ObserveCell) = Lux.initialstates(rng, cell.rssm)
-    
-    struct DynInput
-        tokens::AbstractArray
-        action::AbstractArray
-        reset::AbstractArray
-    end
-    
-    function (cell::ObserveCell)((x, carry)::Tuple, ps_rssm::NamedTuple, st_rssm::NamedTuple)
-        carry_next, entry_t, feat_t = _observe(cell.rssm, carry, x.tokens, x.action, x.reset, ps_rssm, st_rssm)
-        return ((entry_t, feat_t), carry_next), st_rssm # Pass st_rssm through unchanged
-    end
-    
-    function (cell::ObserveCell)(x::DynInput, ps_rssm::NamedTuple, st_rssm::NamedTuple)
-        batch_size = size(x.tokens, 2)
-        carry = initial_carry(cell.rssm, batch_size)
-        carry_next, entry_t, feat_t = _observe(cell.rssm, carry, x.tokens, x.action, x.reset, ps_rssm, st_rssm)
-        return ((entry_t, feat_t), carry_next), st_rssm # Pass st_rssm through unchanged
-    end
-    
-    function StatefulRSSM(;
-            deter_dim::Int = 4096,
-            hidden_dim::Int = 2048,
-            stoch_dim::Int = 32,
-            classes_dim::Int = 32,
-            act::Function = gelu,
-            unimix::Float32 = 0.01f0,
-            imglayers::Int = 2,
-            obslayers::Int = 1,
-            dynlayers::Int = 1,
-            blocks::Int = 8,
-            free_nats::Float32 = 1.0f0,
-            token_dim::Int,        # Added token_dim (mandatory)
-            act_space::Space
-        )
-        rssm = RSSM(;
-            deter_dim,
-            hidden_dim,
-            stoch_dim,
-            classes_dim,
-            act,
-            unimix,
-            imglayers,
-            obslayers,
-            dynlayers,
-            blocks,
-            free_nats,
-            token_dim,
-            act_space
-        )
-
-        l = ObserveCell(rssm);
-        recurrent_observe = StatefulRecurrentCell(l);
-        return recurrent_observe
-    end
-    """
-        initial_state(rssm::RSSM, batch_size::Int, ::AbstractRNG)
-    
-    Returns the initial recurrent state for the RSSM.
-    Output shape: (deter = (batch_size, deter_dim), stoch = (batch_size, stoch_dim, classes_dim))
-    """
-    function LuxCore.initialstates(rng::AbstractRNG, rssm::RSSM)
-        # Delegate state initialization to the sub-layers stored in rssm.core
-        # This will recursively call initialstates on the layers within the core NamedTuple.
-        return (; 
-            core = Lux.initialstates(rng, rssm.core), 
-            observation = Lux.initialstates(rng, rssm.observation),
-            imagination = Lux.initialstates(rng, rssm.imagination)
-        )
-    end
-    
-    """
-        initial_carry(rssm::RSSM, batch_size::Int)
-    
-    Returns the initial carry for the RSSM. Carry is the state of the RSSM.
-    Output shape: (deter = (batch_size, deter_dim), stoch = (batch_size, stoch_dim, classes_dim))
-    """
-    function initial_carry(rssm::RSSM, batch_size::Int)
-        # Ensure we use the correct compute type (e.g., BFloat16)
-        compute_T = isdefined(@__MODULE__, :COMPUTE_TYPE) ? COMPUTE_TYPE : Float32
-        # Replace fill!(similar(...), zero) with zeros(T, dims...)
-        deter_init = zeros(compute_T, rssm.deter_dim, batch_size)
-        stoch_init = zeros(compute_T, rssm.stoch_dim, rssm.classes_dim, batch_size)
-    
-        # Use LuxCore.initialstates to get states for any potential stateful sub-layers later
-        # For now, the state only contains the carry-over tensors.
-        # --- Restore NamedTuple return ---
-        return (; deter = deter_init, stoch = stoch_init)
-    end
-    
-    function observe(rssm::RSSM, carry, tokens, action, reset, ps, st)
-        # seq_tokens shape: (token_dim, T, B)
-        # seq_actions shape: (T, B)
-        # seq_resets shape: (T, B)
-    
-        T = size(tokens, 2) # Get sequence length
-        B = size(tokens, 3) # Get batch size
-    
-        # --- Pre-allocate Output Arrays (Buffer Approach) ---
-        # Determine element type from carry (assuming consistency)
-        el_type = eltype(carry.deter)
-    
-        # Allocate arrays to store the full sequences
-        # Shapes: (feature_dim, T, B) or (feature_dim1, feature_dim2, T, B)
-        seq_deter_out = similar(tokens, el_type, rssm.deter_dim, T, B)
-        # Assuming entry.stoch and feat.logit have same shape structure as initial carry.stoch
-        stoch_dims = size(carry.stoch)[1:end-1] # Get stoch dims excluding Batch
-        seq_stoch_out = similar(tokens, el_type, stoch_dims..., T, B)
-        seq_logit_out = similar(tokens, el_type, stoch_dims..., T, B)
-    
-    
-        current_carry = carry
-        # --- Loop over time steps ---
-        for t in 1:T
-            # Get inputs for the current time step
-            tokens_t = view(tokens, :, t, :) # Shape: (token_dim, B)
-            action_t = view(action, t, :)   # Shape: (B,)
-            reset_t = view(reset, t, :)     # Shape: (B,)
-    
-            # Call the single-step observe function
-            carry_next, entry_t, feat_t = _observe(rssm, current_carry, tokens_t, action_t, reset_t, ps, st);
-    
-            # Store results for this time step directly into pre-allocated arrays
-            view(seq_deter_out, :, t, :) .= entry_t.deter
-            # Use ellipsis `..` for stoch/logit dimensions before T and B
-            view(seq_stoch_out, :, :, t, :) .= entry_t.stoch # Shape (S, C, B)
-            view(seq_logit_out, :, :, t, :) .= feat_t.logit  # Shape (S, C, B)
-    
-    
-            # Update carry for the next iteration
-            current_carry = carry_next
-        end
-    
-        # --- Prepare final outputs ---
-        final_carry = current_carry
-        # The pre-allocated arrays now hold the full sequences
-        final_feat = (; deter=seq_deter_out, stoch=seq_stoch_out, logit=seq_logit_out)
-        final_entry = (; deter=seq_deter_out, stoch=seq_stoch_out)
-    
-        return final_carry, final_entry, final_feat
-    end
-
-    function _observe(rssm::RSSM, carry::NamedTuple, tokens::AbstractArray, action::AbstractVector{T}, reset::AbstractVector{B}, ps, st) where {T<:Integer, B<:Bool} # Use NamedTuple carry
-        # carry: NamedTuple with (deter, stoch)
-        # tokens: Encoded observations, shape (token_dim, Batch) [Assuming single step for now]
-        # action: Discrete action indices for the current step, shape (Batch,)
-        # reset: Boolean vector for the current step, shape (Batch,)
-    
-        # --- 1. Apply reset mask to state ---
-        # Create the inverted mask, ready for broadcasting
-        keep_mask = .!reset # Shape: (Batch,)
-        # Apply mask to deter state
-        deter_mask = reshape(keep_mask, 1, :) # Shape: (1, Batch)
-        deter = carry.deter .* deter_mask # Use NamedTuple access
-        # Apply mask to stoch state
-        stoch_mask = reshape(keep_mask, 1, 1, :) # Shape: (1, 1, Batch)
-        stoch = carry.stoch .* stoch_mask # Use NamedTuple access
-    
-        # --- 2. Process Action ---
-        # Assuming action is discrete and needs one-hot encoding
-        @assert !isnothing(rssm.act_space) "RSSM requires act_space to process actions"
-        num_actions = rssm.act_space.high # Assumes Space defines range [low, high)
-        # Perform one-hot encoding. Note: NNlib.onehotbatch expects indices starting from 1.
-        action_onehot = OneHotArrays.onehotbatch(action, 0:num_actions) # Shape: (num_actions, Batch)
-        action_onehot_casted = cast(action_onehot) # Cast to COMPUTE_TYPE
-        # Apply reset mask to the processed action
-        action = action_onehot_casted .* deter_mask # Broadcast (1, Batch) mask
-    
-        # --- 3. Core Recurrent Update (Transition Model) ---
-        deter_current, _ = _core(rssm, deter, stoch, action, ps, st)
-        
-        # --- 4. Observation Update (Posterior Calculation) ---
-        # 4.1 Combine current deter and tokens
-        tokens = reshape(tokens, :, size(deter_current, ndims(deter_current)));
-        x = vcat(deter_current, tokens)
-        # 4.2 Apply Posterior Layers
-        x_posterior, _ = rssm.observation.posterior_layers(x, ps.observation.posterior_layers, st.observation.posterior_layers)
-        logit_posterior, _ = rssm.observation.logit_posterior(x_posterior, ps.observation.logit_posterior, st.observation.logit_posterior)
-        # 4d. Sample new stochastic state from posterior distribution
-        dist_posterior = _dist(logit_posterior, rssm.unimix)
-        # stoch_current = stoch # Assuming rng is available
-        stoch_current = carry.stoch #Zygote.@ignore rand(rng, dist_posterior) # Using carry.stoch for testing grads
-    
-        # --- 5. Prepare Outputs ---
-        # Calculate components first
-        carry_out = (; deter=deter_current, stoch=stoch_current) # Return NamedTuple carry
-        feat_out = (; deter=deter_current, stoch=stoch_current, logit=logit_posterior)
-        entry_out = (; deter=deter_current, stoch=stoch_current)
-    
-        # Check types before returning the original tuples
-        @assert all(eltype(deter_current) == eltype(stoch_current) == eltype(logit_posterior)) "All variables must have the same element type"
-        
-        # println("entry_out.stoch: ", size(entry_out.stoch))
-        # Return the original tuples
-        return carry_out, entry_out, feat_out
-    end
-
-    flat2group(x, g) = reshape(x, :, g, size(x, ndims(x))); # Use ndims for robustness
-    group2flat(x) = reshape(x, :, size(x, ndims(x))); # Use ndims for robustness
-    
-    function _core(rssm::RSSM, deter::AbstractArray, stoch::AbstractArray, action::AbstractArray, ps, st)
-        # deter shape: (deter_dim, Batch)
-        # stoch shape: (stoch_dim, classes_dim, Batch)
-        # action shape: (num_actions, Batch)
-        
-        # --- Prepare Inputs ---
-        B = size(deter, 2) # Get Batch size from deter
-        # Combine classes and stoch
-        stoch_flat = reshape(stoch, :, B)  # Shape: (stoch_dim * classes_dim, Batch)
-        g = rssm.blocks
-    
-        # --- Create Context --- 
-        # Transform deter, stoch, action using their respective layers
-        # Note: We need the updated state from these layers, even if empty now
-        _deter_ctx, st_deter_new = rssm.core.layer_deter(deter, ps.core.layer_deter, st.core.layer_deter)
-        _stoch_ctx, st_stoch_new = rssm.core.layer_stoch(stoch_flat, ps.core.layer_stoch, st.core.layer_stoch)
-        _action_ctx, st_action_new = rssm.core.layer_action(action, ps.core.layer_action, st.core.layer_action)
-        
-        # Combine context components
-        # Using piping `|>` for readability, similar to the test script
-        context = vcat(_deter_ctx, _stoch_ctx, _action_ctx) |>
-        # Add dimension for broadcasting blocks & repeat
-        ctx -> reshape(ctx, size(ctx, 1), 1, B) |>
-        ctx_reshaped -> repeat(ctx_reshaped, 1, g, 1) |>
-        # Concatenate with grouped original deter state and flatten
-        ctx_repeated -> group2flat(
-            vcat(flat2group(deter, g), ctx_repeated)
-        );
-        
-        # --- Apply GRU Layers (Dynamic Layers + Final BlockLinear) ---
-        # This computes the raw pre-gate values
-        raw_gates, st_gru_new = rssm.core.gru_layers(context, ps.core.gru_layers, st.core.gru_layers)
-        
-        # --- Apply GRU Gating Mechanism --- 
-        # Reshape raw_gates to be block-aware
-        grouped_gates = flat2group(raw_gates, g) # Shape: (FeaturesPerBlock = 3*deter/g, Blocks=g, Batch=B)
-        # Split into 3 gates along the FeaturesPerBlock dimension
-        gates_split = split(grouped_gates, 3, 1) # Tuple of 3 tensors, each: (deter/g, g, B)
-        # Flatten each gate back to (Features, Batch)
-        reset_flat, cand_flat, update_flat = [group2flat(gate) for gate in gates_split] # Each: (deter_dim, B)
-        
-        # Apply activations
-        reset = sigmoid.(reset_flat)
-        cand = tanh.(reset .* cand_flat) # Apply reset gate to candidate pre-activation
-        update = sigmoid.(update_flat .- cast(1))
-        
-        # Combine using update gate (GRU formula)
-        # IMPORTANT: Uses the *original* deter passed into _core
-        deter_next = update .* cand .+ (cast(1) .- update) .* deter 
-        
-        # --- Combine updated states --- 
-        # Create the new state tuple, preserving the structure
-        st_core_updated = (
-            layer_deter = st_deter_new,
-            layer_stoch = st_stoch_new,
-            layer_action = st_action_new,
-            gru_layers = st_gru_new
-        )
-        st_updated = (; core = st_core_updated) # Wrap in the top-level :core key
-    
-        return deter_next, st_updated
-    end
-    
-    function _prior(rssm::RSSM, deter_seq::AbstractArray, ps, st)
-        # Helper to compute prior logits from deterministic sequence
-        # Input deter_seq shape: (deter_dim, T, B)
-        D, T, B = size(deter_seq)
-    
-        # Reshape input for layers: (D, T, B) -> (D, T*B)
-        deter_flat = reshape(deter_seq, D, T * B)
-    
-        # Apply prior feature layers
-        # Use imagination parameters and state
-        prior_features_flat, _ = rssm.imagination.prior_layers(deter_flat, ps.imagination.prior_layers, st.imagination.prior_layers)
-    
-        # Apply prior logit layer
-        prior_logits_flat, _ = rssm.imagination.logit_prior(prior_features_flat, ps.imagination.logit_prior, st.imagination.logit_prior)
-    
-        # Reshape output back: (S, C, T*B) -> (S, C, T, B)
-        prior_logits_seq = reshape(prior_logits_flat, rssm.stoch_dim, rssm.classes_dim, T, B)
-    
-        # Note: Might need to return updated state if layers become stateful
-        return prior_logits_seq
-    end
-end;
+test = 7
+include("helper-gradient.jl")
 
 # Inputs -------------------
-begin
+test < 5 && begin
     
     # --- Configuration & Setup ---
     config = YAML.load_file("dreamerv3/configs.yaml");
@@ -504,7 +50,7 @@ begin
     act_space = Tools.Space(Int32, low=0, high=18);
     
     # RSSM
-    rssm_config = make_config("dyn", "debug");
+    rssm_config = make_config(config, "dyn", "debug");
     rssm = RSSM(
         deter_dim=rssm_config["deter"],
         hidden_dim=rssm_config["hidden"],
@@ -512,7 +58,9 @@ begin
         classes_dim=rssm_config["classes"],
         blocks=rssm_config["blocks"],
         token_dim=size(tokens,1), # Get from encoder
-        act_space=act_space
+        act_space=act_space,
+        unimix=COMPUTE_TYPE(rssm_config["unimix"]),
+        free_nats=COMPUTE_TYPE(rssm_config["free_nats"]),
     );
     
     # Parameters and State
@@ -554,10 +102,10 @@ begin
     println("  - Initial Carry Generated. Deter: ", size(carry_init.deter), ", Stoch: ", size(carry_init.stoch));
 end
 
-
 test == 1 && begin
     println("--- Test Script Finished ---") 
-    model, carry0, tkns, acts, rsts, p, s = rssm, carry_init, tokens, seq_actions, seq_resets, ps.rssm, st.rssm
+    model, carry0, tkns, acts, rsts, p, s = rssm, carry_init, tokens, seq_actions, seq_resets, ps.rssm, st.rssm;
+    # carry, tokens, action, reset, ps, st = carry_init, tokens[:, 1, :], seq_actions[1, :], seq_resets[1, :], ps.rssm, st.rssm;
     function simplified_two_step_array_comprehension_objective(model::RSSM, carry0::NamedTuple, tkns, acts, rsts, p, s) # Use NamedTuple carry0
         println("    - Entering simplified_two_step_array_comprehension_objective...")
         
@@ -745,102 +293,268 @@ test == 4 && begin
     println("--- Iterative Recurrent Objective Test w/ Collection (Test 4) Finished ---")
 end
 
+test == 5 && begin
+    function observe(recurrent_observe::StatefulRecurrentCell, tokens, action, reset, ps, st)
+        # seq_tokens shape: (token_dim, T, B)
+        # seq_actions shape: (T, B)
+        # seq_resets shape: (T, B)
 
-function observe(recurrent_observe::StatefulRecurrentCell, tokens, action, reset, ps, st)
-    # seq_tokens shape: (token_dim, T, B)
-    # seq_actions shape: (T, B)
-    # seq_resets shape: (T, B)
+        T = size(tokens, 2) # Get sequence length
+        B = size(tokens, 3) # Get batch size
+        S, C = recurrent_observe.cell.rssm.stoch_dim, recurrent_observe.cell.rssm.classes_dim # Get stoch and classes dims
+        D = recurrent_observe.cell.rssm.deter_dim # Get deter dim
 
-    T = size(tokens, 2) # Get sequence length
-    B = size(tokens, 3) # Get batch size
-    S, C = recurrent_observe.cell.rssm.stoch_dim, recurrent_observe.cell.rssm.classes_dim # Get stoch and classes dims
-    D = recurrent_observe.cell.rssm.deter_dim # Get deter dim
+        # --- Pre-allocate Output Arrays (Buffer Approach) ---
+        # Determine element type from carry (assuming consistency)
+        el_type = eltype(tokens)
 
-    # --- Pre-allocate Output Arrays (Buffer Approach) ---
-    # Determine element type from carry (assuming consistency)
-    el_type = eltype(tokens)
+        # Allocate arrays to store the full sequences
+        # Shapes: (feature_dim, T, B) or (feature_dim1, feature_dim2, T, B)
+        # seq_deter_out = similar(tokens, el_type, rssm.deter_dim, T, B)
+        # Assuming entry.stoch and feat.logit have same shape structure as initial carry.stoch
+        # stoch_dims = size(carry.stoch)[1:end-1] # Get stoch dims excluding Batch
+        # seq_stoch_out = similar(tokens, el_type, stoch_dims..., T, B)
+        # seq_logit_out = similar(tokens, el_type, stoch_dims..., T, B)
 
-    # Allocate arrays to store the full sequences
-    # Shapes: (feature_dim, T, B) or (feature_dim1, feature_dim2, T, B)
-    # seq_deter_out = similar(tokens, el_type, rssm.deter_dim, T, B)
-    # Assuming entry.stoch and feat.logit have same shape structure as initial carry.stoch
-    # stoch_dims = size(carry.stoch)[1:end-1] # Get stoch dims excluding Batch
-    # seq_stoch_out = similar(tokens, el_type, stoch_dims..., T, B)
-    # seq_logit_out = similar(tokens, el_type, stoch_dims..., T, B)
+        seq_deter_out = Buffer(zeros(el_type, D, T, B))
+        seq_stoch_out = Buffer(zeros(el_type, S, C, T, B))
+        seq_logit_out = Buffer(zeros(el_type, S, C, T, B))
 
-    seq_deter_out = Buffer(zeros(el_type, D, T, B))
-    seq_stoch_out = Buffer(zeros(el_type, S, C, T, B))
-    seq_logit_out = Buffer(zeros(el_type, S, C, T, B))
+        # --- Loop over time steps ---
+        for t in 1:T
+            # Get inputs for the current time step
+            tokens_t = view(tokens, :, t, :) # Shape: (token_dim, B)
+            action_t = view(action, t, :)   # Shape: (B,)
+            reset_t = view(reset, t, :)     # Shape: (B,)
 
-    # --- Loop over time steps ---
-    for t in 1:T
-        # Get inputs for the current time step
-        tokens_t = view(tokens, :, t, :) # Shape: (token_dim, B)
-        action_t = view(action, t, :)   # Shape: (B,)
-        reset_t = view(reset, t, :)     # Shape: (B,)
+            out, st = recurrent_observe(DynInput(tokens_t, action_t, reset_t), ps, st);
+            entry_t, feat_t = out
 
-        out, st = recurrent_observe(DynInput(tokens_t, action_t, reset_t), ps, st);
-        entry_t, feat_t = out
+            
+            # Store results in buffers
+            seq_deter_out[:, t, :] = entry_t.deter
+            seq_stoch_out[:, :, t, :] = entry_t.stoch # Store stoch state
+            seq_logit_out[:, :, t, :] = feat_t.logit
+        end
 
-        
-        # Store results in buffers
-        seq_deter_out[:, t, :] = entry_t.deter
-        seq_stoch_out[:, :, t, :] = entry_t.stoch # Store stoch state
-        seq_logit_out[:, :, t, :] = feat_t.logit
+        # --- Prepare final outputs ---
+        # The pre-allocated arrays now hold the full sequences
+        final_feat = (; deter=copy(seq_deter_out), stoch=copy(seq_stoch_out), logit=copy(seq_logit_out))
+        final_entry = (; deter=copy(seq_deter_out), stoch=copy(seq_stoch_out))
+
+        return (final_entry, final_feat), st
     end
 
-    # --- Prepare final outputs ---
-    # The pre-allocated arrays now hold the full sequences
-    final_feat = (; deter=copy(seq_deter_out), stoch=copy(seq_stoch_out), logit=copy(seq_logit_out))
-    final_entry = (; deter=copy(seq_deter_out), stoch=copy(seq_stoch_out))
+    function loss(recurrent_observe::StatefulRecurrentCell, tokens, action, reset, ps, st)
 
-    return (final_entry, final_feat), st
+        rssm = recurrent_observe.cell.rssm;
+        # Get the final feature output
+        (_, feat), st = observe(recurrent_observe, tokens, action, reset, ps, st);
+
+        # Prior and Posterior Distributions Logits
+        post_logits = feat.logit; # Shape: (S, C, T, B)
+        prior_logits = _prior(rssm, feat.deter, ps, st.cell); # Shape: (S, C, T, B)
+
+        # KL Divergence Losses
+        post_dist = _dist(post_logits, rssm.unimix);
+        prior_dist = _dist(prior_logits, rssm.unimix);
+
+        dyn_elementwise = kl_divergence(_dist(dropgrad(post_logits), rssm.unimix), prior_dist)
+        rep_elementwise = kl_divergence(post_dist, _dist(dropgrad(prior_logits), rssm.unimix))
+
+        # Apply free_nats clamp (Shape: S, T, B)
+        dyn_clamped = max.(dyn_elementwise, COMPUTE_TYPE(rssm.free_nats))
+        rep_clamped = max.(rep_elementwise, COMPUTE_TYPE(rssm.free_nats))
+
+        # Sum over stochastic dimension (dim=1) to match Agg behavior
+        dyn_summed = sum(dyn_clamped; dims=1) # Shape: (1, T, B)
+        rep_summed = sum(rep_clamped; dims=1) # Shape: (1, T, B)
+
+        dyn = dropdims(dyn_summed; dims=1)
+        rep = dropdims(rep_summed; dims=1)
+        # Store scalar losses (using NamedTuple for type stability)
+        losses = (; dyn = dyn, rep = rep)
+
+        return mean(losses.dyn) + mean(losses.rep)
+    end
+
+    l = ObserveCell(rssm);
+    recurrent_observe = StatefulRecurrentCell(l);
+    ps, st = Lux.setup(rng, recurrent_observe);
+    loss(recurrent_observe, tokens, seq_actions, seq_resets, ps, st)
+
+    val, grads = Zygote.withgradient(
+        loss,                # Use the collecting version
+        recurrent_observe,   # The stateful recurrent cell
+        tokens,              # Sequence of inputs
+        seq_actions,         # Parameters of the cell
+        seq_resets,          # Initial state of the cell
+        ps,
+        st
+    )
 end
 
-function loss(recurrent_observe::StatefulRecurrentCell, tokens, action, reset, ps, st)
+test == 6 && begin
+    fullconfig = YAML.load_file("dreamerv3/configs.yaml");
 
-    rssm = recurrent_observe.cell.rssm;
-    # Get the final feature output
-    (_, feat), st = observe(recurrent_observe, tokens, action, reset, ps, st);
+    rng = MersenneTwister(1234);
+    T, B = fullconfig["debug"]["batch_length"], fullconfig["debug"]["batch_size"];
+    config = Dict(component => make_config(fullconfig, component, "debug") for component in ["enc", "dec", "dyn"]);
+    spaces = Dict(:image => Tools.Space(UInt8, (96, 96, 1)), :action => Tools.Space(Int32, low=0, high=18));
 
-    # Prior and Posterior Distributions Logits
-    post_logits = feat.logit; # Shape: (S, C, T, B)
-    prior_logits = _prior(rssm, feat.deter, ps, st.cell); # Shape: (S, C, T, B)
+    agent = WorldModelAgent(config, spaces);
+    ps, st = Lux.setup(rng, agent);
 
-    # KL Divergence Losses
-    post_dist = _dist(post_logits, rssm.unimix);
-    prior_dist = _dist(prior_logits, rssm.unimix);
+    # Observation (example: image)
+    obs_shape = (96, 96, 1, T, B);
+    obs_image = rand(UInt8, obs_shape);
+    obs = (; image = obs_image);
+    seq_actions = rand(rng, spaces[:action].low:spaces[:action].high, T, B);
+    seq_resets = rand(rng, Bool, T, B);
+    tokens, _ = agent.encoder(obs, ps.encoder, st.encoder);
 
-    dyn_elementwise = kl_divergence(_dist(dropgrad(post_logits), rssm.unimix), prior_dist)
-    rep_elementwise = kl_divergence(post_dist, _dist(dropgrad(prior_logits), rssm.unimix))
 
-    # Apply free_nats clamp (Shape: S, T, B)
-    dyn_clamped = max.(dyn_elementwise, COMPUTE_TYPE(rssm.free_nats))
-    rep_clamped = max.(rep_elementwise, COMPUTE_TYPE(rssm.free_nats))
+    loss_vale = loss(agent.rssm, tokens, seq_actions, seq_resets, ps.rssm, st.rssm)
+    println("Loss Value: ", loss_vale)
 
-    # Sum over stochastic dimension (dim=1) to match Agg behavior
-    dyn_summed = sum(dyn_clamped; dims=1) # Shape: (1, T, B)
-    rep_summed = sum(rep_clamped; dims=1) # Shape: (1, T, B)
-
-    dyn = dropdims(dyn_summed; dims=1)
-    rep = dropdims(rep_summed; dims=1)
-    # Store scalar losses (using NamedTuple for type stability)
-    losses = (; dyn = dyn, rep = rep)
-
-    return mean(losses.dyn) + mean(losses.rep)
+    println("Starting Zygote Gradient: ")
+    Zygote.withgradient(
+        p_ -> loss(agent.rssm, tokens, seq_actions, seq_resets, p_, st.rssm),
+        ps.rssm # Differentiate with respect to parameters
+    );
+    println("Zygote Gradient ended")
 end
 
-l = ObserveCell(rssm);
-recurrent_observe = StatefulRecurrentCell(l);
-ps, st = Lux.setup(rng, recurrent_observe);
-loss(recurrent_observe, tokens, seq_actions, seq_resets, ps, st)
+fullconfig = YAML.load_file("dreamerv3/configs.yaml");
 
-val, grads = Zygote.withgradient(
-    loss,                # Use the collecting version
-    recurrent_observe,   # The stateful recurrent cell
-    tokens,              # Sequence of inputs
-    seq_actions,         # Parameters of the cell
-    seq_resets,          # Initial state of the cell
-    ps,
-    st
-)
+rng = MersenneTwister(1234);
+T, B = fullconfig["debug"]["batch_length"], fullconfig["debug"]["batch_size"];
+config = Dict(component => make_config(fullconfig, component, "debug") for component in ["enc", "dec", "dyn"]);
+spaces = Dict(:image => Tools.Space(UInt8, (96, 96, 1)), :action => Tools.Space(Int32, low=0, high=18));
+
+agent = WorldModelAgent(config, spaces);
+ps, st = Lux.setup(rng, agent);
+
+# Observation (example: image)
+obs_shape = (96, 96, 1, T, B);
+obs_image = rand(UInt8, obs_shape);
+obs = (; image = obs_image);
+seq_actions = rand(rng, spaces[:action].low:spaces[:action].high, T, B);
+seq_resets = rand(rng, Bool, T, B);
+tokens, _ = agent.encoder(obs, ps.encoder, st.encoder);
+
+
+loss_val, _ = loss(agent.rssm, tokens, seq_actions, seq_resets, ps.rssm, st.rssm);
+println("Loss Value: ", loss_val)
+
+println("Starting Zygote Gradient: ")
+val, grad = Zygote.withgradient(
+    p_ -> begin
+        loss_val, _ = loss(agent.rssm, tokens, seq_actions, seq_resets, p_, st.rssm)
+        mean(loss_val.dyn) + mean(loss_val.rep)
+    end,
+    ps.rssm # Differentiate with respect to parameters
+);
+println("Zygote Gradient ended")
+
+print_grad_rssm(grad[1])
+
+# --- Refactored Gradient Calculation for Test 7 ---
+function _prior(rssm::RSSM, deter_t::AbstractArray, ps, st)
+    # Helper to compute prior logits from a single step deterministic state
+    # Input deter_t shape: (deter_dim, B)
+    @assert ndims(deter_t) == 2 "Input deter_t must be 2D (deter_dim, B)"
+
+    # Apply prior feature layers directly to the single step input
+    # Use imagination parameters and state
+    # Assumes prior_layers takes (Features, Batch) input
+    prior_features, st_prior_layers = rssm.imagination.prior_layers(deter_t, ps.imagination.prior_layers, st.imagination.prior_layers)
+
+    # Apply prior logit layer
+    # Assumes logit_prior takes (Features, Batch) input and outputs (S, C, B)
+    prior_logits, st_logit_prior = rssm.imagination.logit_prior(prior_features, ps.imagination.logit_prior, st.imagination.logit_prior)
+
+    # TODO: Handle potential state updates from the layers if they become stateful
+    # For now, we are ignoring the returned states st_prior_layers, st_logit_prior
+    # If they need to be managed, the function signature and return value need adjustment.
+
+    # Output shape: (S, C, B)
+    return prior_logits
+end
+
+
+# Objective function with correct recurrence for Zygote
+function rssm_kl_loss_objective(recurrent_layer, initial_st, ps_rssm, tokens_seq, actions_seq, resets_seq)
+    rssm_model = recurrent_layer.cell.rssm # Get the underlying RSSM
+    T = size(tokens_seq, 2)
+    B = size(tokens_seq, 3)
+    el_type = eltype(tokens_seq)
+
+    total_dyn_loss = zero(el_type)
+    total_rep_loss = zero(el_type)
+    current_st = initial_st # Start with initial state
+
+    # Loop through time
+    for t in 1:T
+        # Prepare input for this time step
+        # Ensure action indices are Int for onehotbatch, reset is Bool
+        input_t = ObserveInput(view(tokens_seq, :, t, :),
+                               Int.(view(actions_seq, t, :)),
+                               Bool.(view(resets_seq, t, :)))
+
+        # Apply the stateful recurrent cell for one step
+        (out_step, next_st) = recurrent_layer(input_t, ps_rssm, current_st)
+        entry_t, feat_t = out_step # Unpack the relevant outputs
+
+        # Update state for the next iteration
+        current_st = next_st
+
+        # -- Calculate KL for this step (needs prior based on deter_t) --
+        prior_logits_t = _prior(rssm_model, entry_t.deter, ps_rssm, current_st.cell) # Prior depends on current deter
+        post_logits_t = feat_t.logit
+
+        post_dist_t = _dist(post_logits_t, rssm_model.unimix)
+        prior_dist_t = _dist(prior_logits_t, rssm_model.unimix)
+
+        dyn_elementwise_t = kl_divergence(_dist(Zygote.dropgrad(post_logits_t), rssm_model.unimix), prior_dist_t)
+        rep_elementwise_t = kl_divergence(post_dist_t, _dist(Zygote.dropgrad(prior_logits_t), rssm_model.unimix))
+
+        # Sum over stochastic dimension (dim=1) & drop dim
+        dyn_summed_t = sum(dyn_elementwise_t; dims=1) |> x -> dropdims(x; dims=1) # Shape: (T, B) -> (B,) for step t
+        rep_summed_t = sum(rep_elementwise_t; dims=1) |> x -> dropdims(x; dims=1) # Shape: (T, B) -> (B,) for step t
+
+        # Apply free_nats clamp
+        free_nats_val = convert(eltype(dyn_summed_t), rssm_model.free_nats)
+        # TEMPORARILY REMOVE CLAMP for gradient testing
+        loss_dyn_t = dyn_summed_t # max.(dyn_summed_t, free_nats_val)
+        loss_rep_t = rep_summed_t # max.(rep_summed_t, free_nats_val)
+
+        total_dyn_loss += mean(loss_dyn_t) # Accumulate mean loss per step
+        total_rep_loss += mean(loss_rep_t) # Accumulate mean loss per step
+    end
+
+    # Return average loss across time
+    return (total_dyn_loss + total_rep_loss) / T
+end
+
+# recurrent_layer, initial_st, ps_rssm, tokens_seq, actions_seq, resets_seq = agent.rssm, st.rssm, ps.rssm, tokens, seq_actions, seq_resets;
+
+rssm_kl_loss_objective(agent.rssm, st.rssm, ps.rssm, tokens, seq_actions, seq_resets)
+
+println("Starting Zygote Gradient (Test 7 - Refactored): ")
+val, grad = Zygote.withgradient(
+    (p, s) -> rssm_kl_loss_objective(agent.rssm, s, p, tokens, seq_actions, seq_resets),
+    ps.rssm, # Parameters to differentiate w.r.t.
+    st.rssm  # Initial state (should not get gradient)
+);
+println("Loss Value (Refactored): ", val)
+println("Zygote Gradient ended (Test 7 - Refactored)")
+
+# grad[1] should now contain non-zero gradients for ps.rssm
+# grad[2] should be nothing (gradient w.r.t. initial state st.rssm)
+if grad[1] !== nothing
+    print_grad_rssm(grad[1]) # Use your helper function
+else
+    println("Gradients are still nothing!")
+end
+

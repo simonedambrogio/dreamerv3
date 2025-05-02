@@ -1,25 +1,30 @@
 using Lux, NNlib, Random, Tools, BFloat16s, YAML, Statistics, LuxCore, OneHotArrays
 using StatsBase: Weights # Added for sampling
-using NNlib: logsoftmax, softmax # Ensure these are available
 using StatsBase
 using OneHotArrays: onehot # Added for encoding
 using Zygote
 using SliceMap # Needed for preparing scan input
-using Zygote: Buffer, @ignore # Import Buffer
+using ChainRulesCore
+using Zygote: @ignore
+# include("../embodied/lux/rms.jl");
+# include("../embodied/lux/nets.jl");
+# include("../embodied/lux/BlockLinear.jl");
+# include("../embodied/lux/ReArrange.jl");
+# Note: We might need more includes later as we add specific layers
 
 # Based on Python RSSM class attributes
-struct RSSM{AS, CN, PO, OI, T} <: Lux.AbstractLuxContainerLayer{(:core, :observation, :imagination)} # Added AS for type stability
+struct RSSM{AS, CN, PO, OI} <: Lux.AbstractLuxContainerLayer{(:core, :observation, :imagination)} # Added AS for type stability
     deter_dim::Int
     hidden_dim::Int
     stoch_dim::Int
     classes_dim::Int
     act::Function
-    unimix::T
+    unimix::Float32
     imglayers::Int
     obslayers::Int
     dynlayers::Int
     blocks::Int
-    free_nats::T
+    free_nats::Float32
     token_dim::Int  # Added token dimension
     act_space::AS # Use type parameter AS
     # Sub-layers defined in core
@@ -34,14 +39,14 @@ function RSSM(; # Constructor
     stoch_dim::Int = 32,
     classes_dim::Int = 32,
     act::Function = gelu,
+    unimix::Float32 = 0.01f0,
     imglayers::Int = 2,
     obslayers::Int = 1,
     dynlayers::Int = 1,
     blocks::Int = 8,
-    unimix::T,
-    free_nats::T,
+    free_nats::Float32 = 1.0f0,
     token_dim::Int,        # Added token_dim (mandatory)
-    act_space::Space) where T<:Real # act_space is mandatory
+    act_space::Space) # act_space is mandatory
 
     # --- Calculate Static Dimensions ---
     g = blocks
@@ -169,69 +174,6 @@ function LuxCore.initialstates(rng::AbstractRNG, rssm::RSSM)
     )
 end
 
-# --- ObserveCell Definition (Moved Inside) ---
-struct ObserveCell <: Lux.AbstractRecurrentCell
-    rssm::RSSM
-end
-# Parameters are those of the underlying RSSM
-Lux.initialparameters(rng::AbstractRNG, cell::ObserveCell) = Lux.initialparameters(rng, cell.rssm)
-# State is that of the underlying RSSM's components
-Lux.initialstates(rng::AbstractRNG, cell::ObserveCell) = Lux.initialstates(rng, cell.rssm)
-
-struct ObserveInput
-    tokens::AbstractArray
-    action::AbstractArray
-    reset::AbstractArray
-end
-
-function (cell::ObserveCell)((x, carry)::Tuple, ps_rssm::NamedTuple, st_rssm::NamedTuple)
-    carry_next, entry_t, feat_t = _observe(cell.rssm, carry, x.tokens, x.action, x.reset, ps_rssm, st_rssm)
-    return ((entry_t, feat_t), carry_next), st_rssm # Pass st_rssm through unchanged
-end
-
-function (cell::ObserveCell)(x::ObserveInput, ps_rssm::NamedTuple, st_rssm::NamedTuple)
-    batch_size = size(x.tokens, 2)
-    carry = initial_carry(cell.rssm, batch_size)
-    carry_next, entry_t, feat_t = _observe(cell.rssm, carry, x.tokens, x.action, x.reset, ps_rssm, st_rssm)
-    return ((entry_t, feat_t), carry_next), st_rssm # Pass st_rssm through unchanged
-end
-
-function StatefulRSSM(;
-        deter_dim::Int = 4096,
-        hidden_dim::Int = 2048,
-        stoch_dim::Int = 32,
-        classes_dim::Int = 32,
-        act::Function = gelu,
-        imglayers::Int = 2,
-        obslayers::Int = 1,
-        dynlayers::Int = 1,
-        blocks::Int = 8,
-        unimix::T,
-        free_nats::T,
-        token_dim::Int,        # Added token_dim (mandatory)
-        act_space::Space
-    ) where T<:Real
-    rssm = RSSM(;
-        deter_dim,
-        hidden_dim,
-        stoch_dim,
-        classes_dim,
-        act,
-        unimix,
-        imglayers,
-        obslayers,
-        dynlayers,
-        blocks,
-        free_nats,
-        token_dim,
-        act_space
-    )
-
-    l = ObserveCell(rssm);
-    recurrent_observe = StatefulRecurrentCell(l);
-    return recurrent_observe
-end;
-
 """
     initial_carry(rssm::RSSM, batch_size::Int)
 
@@ -242,40 +184,36 @@ function initial_carry(rssm::RSSM, batch_size::Int)
     # Ensure we use the correct compute type (e.g., BFloat16)
     compute_T = isdefined(@__MODULE__, :COMPUTE_TYPE) ? COMPUTE_TYPE : Float32
     # Let's stick to Lux convention for layers, but the state `carry`
-    deter_init = zeros(compute_T, rssm.deter_dim, batch_size)
-        stoch_init = zeros(compute_T, rssm.stoch_dim, rssm.classes_dim, batch_size)
+    deter_init = fill!(similar(Array{compute_T}, rssm.deter_dim, batch_size), zero(compute_T))
+    stoch_init = fill!(similar(Array{compute_T}, rssm.stoch_dim, rssm.classes_dim, batch_size), zero(compute_T))
 
     # Use LuxCore.initialstates to get states for any potential stateful sub-layers later
     # For now, the state only contains the carry-over tensors.
     return (; deter = deter_init, stoch = stoch_init)
 end
 
-function observe(recurrent_observe::StatefulRecurrentCell, tokens, action, reset, ps, st)
+function observe(rssm::RSSM, carry, tokens, action, reset, ps, st)
     # seq_tokens shape: (token_dim, T, B)
     # seq_actions shape: (T, B)
     # seq_resets shape: (T, B)
 
     T = size(tokens, 2) # Get sequence length
     B = size(tokens, 3) # Get batch size
-    S, C = recurrent_observe.cell.rssm.stoch_dim, recurrent_observe.cell.rssm.classes_dim # Get stoch and classes dims
-    D = recurrent_observe.cell.rssm.deter_dim # Get deter dim
 
     # --- Pre-allocate Output Arrays (Buffer Approach) ---
     # Determine element type from carry (assuming consistency)
-    el_type = eltype(tokens)
+    el_type = eltype(carry.deter)
 
     # Allocate arrays to store the full sequences
     # Shapes: (feature_dim, T, B) or (feature_dim1, feature_dim2, T, B)
-    # seq_deter_out = similar(tokens, el_type, rssm.deter_dim, T, B)
+    seq_deter_out = similar(tokens, el_type, rssm.deter_dim, T, B)
     # Assuming entry.stoch and feat.logit have same shape structure as initial carry.stoch
-    # stoch_dims = size(carry.stoch)[1:end-1] # Get stoch dims excluding Batch
-    # seq_stoch_out = similar(tokens, el_type, stoch_dims..., T, B)
-    # seq_logit_out = similar(tokens, el_type, stoch_dims..., T, B)
+    stoch_dims = size(carry.stoch)[1:end-1] # Get stoch dims excluding Batch
+    seq_stoch_out = similar(tokens, el_type, stoch_dims..., T, B)
+    seq_logit_out = similar(tokens, el_type, stoch_dims..., T, B)
 
-    seq_deter_out = Buffer(zeros(el_type, D, T, B))
-    seq_stoch_out = Buffer(zeros(el_type, S, C, T, B))
-    seq_logit_out = Buffer(zeros(el_type, S, C, T, B))
 
+    current_carry = carry
     # --- Loop over time steps ---
     for t in 1:T
         # Get inputs for the current time step
@@ -283,22 +221,198 @@ function observe(recurrent_observe::StatefulRecurrentCell, tokens, action, reset
         action_t = view(action, t, :)   # Shape: (B,)
         reset_t = view(reset, t, :)     # Shape: (B,)
 
-        out, st = recurrent_observe(ObserveInput(tokens_t, action_t, reset_t), ps, st);
-        entry_t, feat_t = out
+        # Call the single-step observe function
+        carry_next, entry_t, feat_t = _observe(rssm, current_carry, tokens_t, action_t, reset_t, ps, st);
 
-        
-        # Store results in buffers
-        seq_deter_out[:, t, :] = entry_t.deter
-        seq_stoch_out[:, :, t, :] = entry_t.stoch # Store stoch state
-        seq_logit_out[:, :, t, :] = feat_t.logit
+        # Store results for this time step directly into pre-allocated arrays
+        view(seq_deter_out, :, t, :) .= entry_t.deter
+        # Use ellipsis `..` for stoch/logit dimensions before T and B
+        view(seq_stoch_out, :, :, t, :) .= entry_t.stoch # Shape (S, C, B)
+        view(seq_logit_out, :, :, t, :) .= feat_t.logit  # Shape (S, C, B)
+
+
+        # Update carry for the next iteration
+        current_carry = carry_next
     end
 
     # --- Prepare final outputs ---
+    final_carry = current_carry
     # The pre-allocated arrays now hold the full sequences
-    final_feat = (; deter=copy(seq_deter_out), stoch=copy(seq_stoch_out), logit=copy(seq_logit_out))
-    final_entry = (; deter=copy(seq_deter_out), stoch=copy(seq_stoch_out))
+    final_feat = (; deter=seq_deter_out, stoch=seq_stoch_out, logit=seq_logit_out)
+    final_entry = (; deter=seq_deter_out, stoch=seq_stoch_out)
 
-    return (final_entry, final_feat), st
+    return final_carry, final_entry, final_feat
+end
+
+function ChainRulesCore.rrule(::typeof(observe), rssm::RSSM, carry_in::NamedTuple, tokens::AbstractArray, action::AbstractArray, reset::AbstractArray, ps::NamedTuple, st::NamedTuple)
+    # --- Forward Pass --- (Essentially the original observe function)
+    T = size(tokens, 2)
+    B = size(tokens, 3)
+    el_type = eltype(carry_in.deter)
+    seq_deter_out = similar(tokens, el_type, rssm.deter_dim, T, B)
+    stoch_dims = size(carry_in.stoch)[1:end-1]
+    seq_stoch_out = similar(tokens, el_type, stoch_dims..., T, B)
+    seq_logit_out = similar(tokens, el_type, stoch_dims..., T, B)
+
+    # Store intermediate carries for the pullback
+    carries_intermediate = Vector{typeof(carry_in)}(undef, T)
+
+    current_carry = carry_in
+    for t in 1:T
+        tokens_t = view(tokens, :, t, :)
+        action_t = view(action, t, :)
+        reset_t = view(reset, t, :)
+
+        # Store carry *before* the step
+        carries_intermediate[t] = current_carry
+
+        carry_next, entry_t, feat_t = _observe(rssm, current_carry, tokens_t, action_t, reset_t, ps, st);
+
+        # Assign results (mutation happens here, but Zygote won't see it)
+        view(seq_deter_out, :, t, :) .= entry_t.deter
+        view(seq_stoch_out, :, :, t, :) .= entry_t.stoch
+        view(seq_logit_out, :, :, t, :) .= feat_t.logit
+
+        current_carry = carry_next
+    end
+    final_carry = current_carry
+    final_feat = (; deter=seq_deter_out, stoch=seq_stoch_out, logit=seq_logit_out)
+    final_entry = (; deter=seq_deter_out, stoch=seq_stoch_out)
+
+    # --- Pullback Definition ---
+    function observe_pullback(Δoutputs)
+        # Δoutputs is a tuple: (Δfinal_carry, Δfinal_entry, Δfinal_feat)
+        Δfinal_carry = Δoutputs[1] # Gradient w.r.t. the last carry state
+        Δfinal_entry = Δoutputs[2] # Gradient w.r.t. the entry sequence tuple (deter, stoch)
+        Δfinal_feat = Δoutputs[3]  # Gradient w.r.t. the feat sequence tuple (deter, stoch, logit)
+
+        # Initialize zero tangents for inputs - create full arrays now
+        Δps = Zygote.zero_tangent(ps)
+        # Use zero.() instead of non-existent Zygote.zeros_like
+        Δtokens = zero.(tokens)
+        Δaction = zero.(action)
+        Δreset = zero.(reset)
+        Δcarry_accum = Zygote.zero_tangent(carry_in)
+
+        Δcarry_t_plus_1 = Δfinal_carry
+
+        for t in T:-1:1
+            carry_t = carries_intermediate[t]
+            tokens_t = view(tokens, :, t, :)
+            action_t = view(action, t, :)
+            reset_t = view(reset, t, :)
+
+            # --- Initialize and Accumulate Output Gradients for _observe step t ---
+            # Use expected output types (BFloat16) for zero tangents
+            el_type_expected = COMPUTE_TYPE
+            # Use carry_t for shape reference, but ensure eltype is el_type_expected
+            zero_deter = Zygote.zero_tangent(similar(carry_t.deter, el_type_expected))
+            zero_stoch = Zygote.zero_tangent(similar(carry_t.stoch, el_type_expected))
+            zero_logit = Zygote.zero_tangent(similar(carry_t.stoch, el_type_expected)) # Assume same shape/type as stoch
+
+            # Initialize components explicitly (as BFloat16 zero tangents)
+            Δdeter_entry_accum = zero_deter
+            Δstoch_entry_accum = zero_stoch
+            Δdeter_feat_accum = zero_deter
+            Δstoch_feat_accum = zero_stoch
+            Δlogit_feat_accum = zero_logit
+
+            # Accumulate from Δfinal_entry (Gradients w.r.t `entry` sequence)
+            if !isnothing(Δfinal_entry) && !isa(Δfinal_entry, ZeroTangent)
+                # Cast incoming gradients before adding, just in case they mixed somewhere
+                Δdeter_entry_accum = Δdeter_entry_accum + cast(view(Δfinal_entry.deter, :, t, :))
+                Δstoch_entry_accum = Δstoch_entry_accum + cast(view(Δfinal_entry.stoch, :, :, t, :))
+            end
+
+            # Accumulate from Δfinal_feat (Gradients w.r.t `feat` sequence)
+            if !isnothing(Δfinal_feat) && !isa(Δfinal_feat, ZeroTangent)
+                # Cast Float32 gradients back to BFloat16 before adding
+                Δdeter_feat_accum = Δdeter_feat_accum + cast(view(Δfinal_feat.deter, :, t, :))
+                Δstoch_feat_accum = Δstoch_feat_accum + cast(view(Δfinal_feat.stoch, :, :, t, :))
+                Δlogit_feat_accum = Δlogit_feat_accum + cast(view(Δfinal_feat.logit, :, :, t, :))
+            end
+
+            # Construct tangents for _observe output matching (carry_next, entry, feat)
+            # Ensure types match expected BFloat16 output types
+            entry_t_expected_type = @NamedTuple{deter::Matrix{el_type_expected}, stoch::Array{el_type_expected, 3}}
+            feat_t_expected_type = @NamedTuple{deter::Matrix{el_type_expected}, stoch::Array{el_type_expected, 3}, logit::Array{el_type_expected, 3}}
+            carry_t_expected_type = @NamedTuple{deter::Matrix{el_type_expected}, stoch::Array{el_type_expected, 3}} # Type for carry
+
+            Δentry_t = Tangent{entry_t_expected_type}(; deter=Δdeter_entry_accum, stoch=Δstoch_entry_accum)
+            Δfeat_t = Tangent{feat_t_expected_type}(; deter=Δdeter_feat_accum, stoch=Δstoch_feat_accum, logit=Δlogit_feat_accum)
+
+            # Cast Δcarry_t_plus_1 to ensure it's the expected BFloat16 Tangent type
+            Δcarry_t_plus_1_casted = cast(Tangent{carry_t_expected_type}(; deter=Δcarry_t_plus_1.deter, stoch=Δcarry_t_plus_1.stoch))
+
+            # The structure passed to pullback_step must match the structure returned by _observe: (carry_next, entry, feat)
+            Δobserve_output_tuple = (Δcarry_t_plus_1_casted, Δentry_t, Δfeat_t)
+
+            # --- Call Zygote.pullback on _observe ---
+            _observe_pb = @ignore_derivatives Zygote.pullback(_observe, rssm, carry_t, tokens_t, action_t, reset_t, ps, st)
+            if isnothing(_observe_pb)
+                error("_observe function is not differentiable by Zygote.")
+            end
+            _, pullback_step = _observe_pb
+
+            # Apply the pullback for the single step
+            grads_step = pullback_step(Δobserve_output_tuple)
+
+            # Extract gradients for inputs of _observe
+            # grads_step = (∇_observe, ∇rssm, ∇carry_t, ∇tokens_t, ∇action_t, ∇reset_t, ∇ps, ∇st)
+            # Cast gradients received from pullback_step if necessary before accumulation
+            Δcarry_t = cast(grads_step[3]) # Cast gradient w.r.t carry_t
+            Δtokens_t = cast(grads_step[4])
+            Δaction_t = cast(grads_step[5]) # Action grad might be different type? Check Zygote output. Cast should handle ZeroTangent.
+            Δreset_t = grads_step[6] # Reset grad should be Nothing/ZeroTangent
+            Δps_t = cast(grads_step[7]) # Cast parameter gradients
+
+            # --- Accumulate Gradients (Explicitly, no in-place) ---
+            # Accumulate carry gradient (already casted)
+            # Handle potential ZeroTangent for Δcarry_accum initialization if carry_in was zero
+            if isa(Δcarry_accum, ZeroTangent) && !isa(Δcarry_t, ZeroTangent)
+                 Δcarry_accum = Δcarry_t # Initialize if first non-zero grad
+            elseif !isa(Δcarry_t, ZeroTangent)
+                 # Use Zygote's safe addition for NamedTuples/Tangents
+                 Δcarry_accum = Zygote.accum(Δcarry_accum, Δcarry_t)
+             end
+
+            # Accumulate into the full gradient arrays using view and + (Ensure casted grads)
+            if !isa(Δtokens_t, ZeroTangent)
+                current_token_grad_view = view(Δtokens, :, t, :)
+                # Ensure view is mutable if using .=
+                # Using explicit add and assign might be safer with views
+                view(Δtokens, :, t, :) .= current_token_grad_view .+ Δtokens_t
+            end
+
+            if !isa(Δaction_t, ZeroTangent)
+                 current_action_grad_view = view(Δaction, t, :)
+                 # Action gradient needs careful handling due to one-hot.
+                 # Zygote pullback for onehot should return gradient w.r.t indices?
+                 # Or w.r.t the onehot output? Assuming latter.
+                 # Gradient type might be Float, needs accumulation into Δaction (which is also Float?)
+                 # Let's assume Δaction is initialized correctly (e.g., zero.())
+                 # Check eltype of Δaction_t - should be COMPUTE_TYPE if it flowed through layers
+                 view(Δaction, t, :) .= current_action_grad_view .+ Δaction_t # Assuming compatible types
+            end
+
+            # Reset gradient accumulation (likely always zero/nothing)
+            if !isnothing(Δreset_t) && !isa(Δreset_t, ZeroTangent)
+                 current_reset_grad_view = view(Δreset, t, :)
+                 view(Δreset, t, :) .= current_reset_grad_view .+ Δreset_t # Add if non-zero grad exists
+            end
+
+            # Accumulate parameter gradients (already casted)
+            Δps = Zygote.accum(Δps, Δps_t) # Use Zygote.accum for safe addition
+
+            # Propagate carry gradient for the *next* iteration (t-1)
+            Δcarry_t_plus_1 = Δcarry_t # Already casted
+        end
+
+        # Return gradients for inputs of observe
+        return (ChainRulesCore.NO_FIELDS, Δcarry_accum, Δtokens, Δaction, Δreset, Δps, ChainRulesCore.DoesNotExist())
+    end
+
+    return (final_carry, final_entry, final_feat), observe_pullback
 end
 
 function _observe(rssm::RSSM, carry::NamedTuple, tokens::AbstractArray, action::AbstractVector{T}, reset::AbstractVector{B}, ps, st) where {T<:Integer, B<:Bool}
@@ -340,11 +454,7 @@ function _observe(rssm::RSSM, carry::NamedTuple, tokens::AbstractArray, action::
     logit_posterior, _ = rssm.observation.logit_posterior(x_posterior, ps.observation.logit_posterior, st.observation.logit_posterior)
     # 4d. Sample new stochastic state from posterior distribution
     dist_posterior = _dist(logit_posterior, rssm.unimix)
-    # Use sample_ste to get the one-hot state with straight-through gradients
-    # Assuming rng is available in the scope (might need to be passed explicitly)
-    # TODO: Ensure rng is available here. If not, pass it as an argument.
-    rng = Random.default_rng() # Placeholder: Get default RNG if not passed
-    stoch_current = sample_ste(rng, dist_posterior)
+    stoch_current = Zygote.@ignore rand(rng, dist_posterior) # Assuming rng is available
 
     # --- 5. Prepare Outputs ---
     carry = (; deter=deter_current, stoch=stoch_current)
@@ -445,36 +555,52 @@ function _prior(rssm::RSSM, deter_seq::AbstractArray, ps, st)
     return prior_logits_seq
 end
 
-function loss(stateful_rssm::StatefulRecurrentCell, tokens, action, reset, ps, st)
+function loss(rssm::RSSM, carry, tokens, action, reset, ps, st)
+    # carry: NamedTuple with .deter and .stoch
+    # tokens: Encoded observations, shape (token_dim, T, B)
+    # action: Discrete action indices for the current step, shape (T, B)
+    # reset: Boolean vector for the current step, shape (T, B)
 
-    rssm = stateful_rssm.cell.rssm;
-    # Get the final feature output
-    (_, feat), st = observe(stateful_rssm, tokens, action, reset, ps, st);
+    carry, entry, feat = observe(rssm, carry, tokens, action, reset, ps, st);
 
     # Prior and Posterior Distributions Logits
-    post_logits = feat.logit; # Shape: (S, C, T, B)
-    prior_logits = _prior(rssm, feat.deter, ps, st.cell); # Shape: (S, C, T, B)
+    post_logits = feat.logit # Shape: (S, C, T, B)
+    prior_logits = _prior(rssm, feat.deter, ps, st) # Shape: (S, C, T, B)
 
     # KL Divergence Losses
     post_dist = _dist(post_logits, rssm.unimix);
     prior_dist = _dist(prior_logits, rssm.unimix);
 
-    dyn_elementwise = kl_divergence(_dist(dropgrad(post_logits), rssm.unimix), prior_dist) # Shape: (S, T, B)
-    rep_elementwise = kl_divergence(post_dist, _dist(dropgrad(prior_logits), rssm.unimix)) # Shape: (S, T, B)
+    # Calculate elementwise KL (Shape: S, T, B)
+    dyn_elementwise = kl_divergence(_dist(dropgrad(post_logits), rssm.unimix), prior_dist)
+    rep_elementwise = kl_divergence(post_dist, _dist(dropgrad(prior_logits), rssm.unimix))
+
+    # Apply free_nats clamp (Shape: S, T, B)
+    dyn_clamped = max.(dyn_elementwise, rssm.free_nats)
+    rep_clamped = max.(rep_elementwise, rssm.free_nats)
 
     # Sum over stochastic dimension (dim=1) to match Agg behavior
-    dyn_summed = sum(dyn_elementwise; dims=1) |> # Shape: (1, T, B)
-    x -> dropdims(x; dims=1) # Shape: (T, B)
-    rep_summed = sum(rep_elementwise; dims=1) |> # Shape: (1, T, B)
-    x -> dropdims(x; dims=1) # Shape: (T, B)
+    dyn_summed = sum(dyn_clamped; dims=1) # Shape: (1, T, B)
+    rep_summed = sum(rep_clamped; dims=1) # Shape: (1, T, B)
 
-    dyn = max.(dyn_summed, rssm.free_nats)
-    rep = max.(rep_summed, rssm.free_nats)
-
+    dyn = dropdims(dyn_summed; dims=1)
+    rep = dropdims(rep_summed; dims=1)
     # Store scalar losses (using NamedTuple for type stability)
     losses = (; dyn = dyn, rep = rep)
 
-    return losses, feat, st
+    # --- Calculate Metrics ---
+    prior_entropy_elementwise = entropy(prior_dist) # Shape: (S, T, B)
+    post_entropy_elementwise = entropy(post_dist)   # Shape: (S, T, B)
+
+    # Average entropy over all dimensions (S, T, B) to get scalar metrics
+    prior_entropy_scalar = mean(prior_entropy_elementwise)
+    post_entropy_scalar = mean(post_entropy_elementwise)
+
+    metrics = (; dyn_ent = prior_entropy_scalar, rep_ent = post_entropy_scalar)
+
+    # Placeholder return - return the losses, state, and metrics
+    return carry, entry, losses, feat, metrics # Updated return
+
 end
 
 # --- Distribution Helper ---
@@ -485,9 +611,9 @@ end
 Represents stoch_dim independent categorical distributions per batch item,
 with unimix label smoothing. Sampling returns a one-hot encoded tensor.
 """
-struct OneHotDist{T}
+struct OneHotDist{T, U}
     logits::T # Shape (stoch_dim, classes_dim, Batch...)
-    unimix::eltype(T) # Float, probability for uniform mixing
+    unimix::U # Float, probability for uniform mixing
 end
 
 """
@@ -498,62 +624,6 @@ Helper function to create the OneHotDist object.
 function _dist(logits, unimix::Real)
     return OneHotDist(logits, unimix)
 end
-
-"""
-    sample_ste(rng::AbstractRNG, d::OneHotDist)
-
-Sample from the OneHotDist and apply the Straight-Through Estimator (STE).
-Uses smoothed probabilities for sampling but unsmoothed probabilities for gradient flow.
-Output shape: (stoch_dim, classes_dim, Batch...)
-"""
-function sample_ste(rng::AbstractRNG, d::OneHotDist)
-    logits = d.logits
-    unimix = d.unimix
-    stoch_dim, classes_dim = size(logits, 1), size(logits, 2)
-    batch_dims = size(logits)[3:end]
-    compute_T = eltype(logits)
-
-    # --- Sampling based on smoothed probabilities --- 
-    probs_raw = softmax(logits; dims=2)
-    probs_smoothed = (1 - unimix) .* probs_raw .+ unimix / classes_dim
-    probs_clipped = max.(probs_smoothed, zero(compute_T))
-
-    num_distributions = stoch_dim * prod(batch_dims; init=1)
-    probs_2d = reshape(permutedims(probs_clipped, (1, 3:ndims(probs_clipped)..., 2)), num_distributions, classes_dim)
-
-    # Use a comprehension for functional creation of sampled_indices
-    sampled_indices = [begin
-        prob_view = view(probs_2d, i, :)
-        prob_sum = one(eltype(prob_view))
-        prob_weights = Weights(prob_view, prob_sum)
-        StatsBase.sample(rng, 1:classes_dim, prob_weights)
-    end for i in 1:num_distributions]
-
-    # --- One-hot encode the sampled index (value for forward pass) ---
-    indices_final_shape = (stoch_dim, batch_dims...)
-    indices_reshaped = reshape(sampled_indices, indices_final_shape)
-
-    # Use OneHotArrays.onehotbatch for non-mutating creation
-    # onehotbatch creates shape (num_classes, shape_of_indices...)
-    # Input indices_reshaped shape: (stoch_dim, batch_dims...)
-    value_onehot_permuted = OneHotArrays.onehotbatch(indices_reshaped, 1:classes_dim)
-    # Output shape: (classes_dim, stoch_dim, batch_dims...)
-
-    # Permute to desired shape: (stoch_dim, classes_dim, batch_dims...)
-    # Original index dims were (1, 2...), target index dims are (2, 1, 3...)
-    perm = (2, 1, (3:ndims(value_onehot_permuted))...)
-    value_onehot = permutedims(value_onehot_permuted, perm)
-
-    # --- Apply Straight-Through Estimator (STE) ---
-    # STE: sg(value) + (probs - sg(probs))
-    # Use Zygote.@ignore to stop gradients for the discrete parts
-    # Use the *unsmoothed* probs_raw for the gradient path
-    ste_value = Zygote.@ignore(value_onehot) .+ (probs_raw .- Zygote.@ignore(probs_raw))
-
-    # --- Cast final result to compute type ---
-    return cast(ste_value)
-end
-
 
 """
     Base.rand(rng::AbstractRNG, d::OneHotDist)
@@ -614,8 +684,10 @@ function Base.rand(rng::AbstractRNG, d::OneHotDist)
     return cast(stoch_onehot) # Assumes cast function handles Bool -> compute_T
 end
 
-
 # --- End Distribution Helper ---
+
+using NNlib: logsoftmax, softmax # Ensure these are available
+
 """
     kl_divergence(posterior_dist::OneHotDist, prior_dist::OneHotDist)
 

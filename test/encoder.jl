@@ -309,3 +309,44 @@ catch e
 end
 
 println("---------------------------------")
+
+
+
+include("../dreamerv3/agents.jl");
+
+fullconfig = YAML.load_file("dreamerv3/configs.yaml");
+
+rng = MersenneTwister(1234);
+T, B = fullconfig["debug"]["batch_length"], fullconfig["debug"]["batch_size"];
+config = Dict(component => make_config(fullconfig, component, "debug") for component in ["enc", "dec", "dyn"]);
+spaces = Dict(:image => Tools.Space(UInt8, (96, 96, 1)), :action => Tools.Space(Int32, low=0, high=18));
+
+agent = WorldModelAgent(config, spaces);
+ps, st = Lux.setup(rng, agent);
+
+# Observation (example: image)
+obs_shape = (96, 96, 1, T, B);
+obs_image = rand(UInt8, obs_shape);
+obs = (; image = obs_image);
+seq_actions = rand(rng, spaces[:action].low:spaces[:action].high, T, B);
+seq_resets = rand(rng, Bool, T, B);
+tokens, _ = agent.encoder(obs, ps.encoder, st.encoder);
+
+function loss_fn(encoder, x_obs, ps, st)
+    output, st_new = encoder(x_obs, ps, st) # Use m for model, p for params, s for state
+    return sum(output), st_new # Return state to avoid grad issues if loss depends on it (though not here)
+end;
+
+loss_val, _ = loss_fn(agent.encoder, obs, ps.encoder, st.encoder)
+println("  - Loss value: ", loss_val)
+
+loss_val_zygote, grad_zygote = Zygote.withgradient(
+    p_ -> begin # p_ represents the parameters (ps)
+        loss_val, _ = loss_fn(agent.encoder, obs, p_, st.encoder) # Pass enc, obs, p_, st
+        loss_val
+    end,
+    ps.encoder # Differentiate with respect to parameters
+);
+
+
+

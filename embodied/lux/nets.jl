@@ -1,9 +1,11 @@
 using Lux, NNlib, Random
 using BFloat16s
 using ChainRulesCore # Need this for ZeroTangent, Tangent
+using ForwardDiff # Import ForwardDiff to use its types
 
 # Define the compute type globally
-const COMPUTE_TYPE = BFloat16 # Changed back from Float32
+# const COMPUTE_TYPE = BFloat16
+const COMPUTE_TYPE = Float32
 
 function cast(x::Number)
     if x isa COMPUTE_TYPE
@@ -44,6 +46,13 @@ function cast(t::Tangent{P, T}) where {P, T<:NamedTuple}
     # Return new Tangent with casted backing
     # Ensure the primal type P is preserved
     return Tangent{P, typeof(new_backing)}(new_backing)
+end
+
+# Cast for ForwardDiff.Dual types introduced by AD
+function cast(d::ForwardDiff.Dual)
+    # Extract the value, cast it to COMPUTE_TYPE.
+    # AD system handles the partials.
+    return cast(ForwardDiff.value(d))
 end
 
 # Cast for regular NamedTuples (often used for gradients)
