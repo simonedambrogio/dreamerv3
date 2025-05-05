@@ -1,4 +1,4 @@
-include("../dreamerv3/agents.jl");
+include("../dreamerv3/WorldModel.jl");
 using Optimisers
 
 # Start Test ------------------------------------------------------------

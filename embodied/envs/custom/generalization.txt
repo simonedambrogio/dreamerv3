@@ -1,0 +1,81 @@
+**Environment**
+*Description*
+	This task is designed to test generalisation. There are 4 main states, which I refer to as trial, which are repeated over and over again.
+	Image1, image2, and image3 are abstract containers of types of images. 
+	Different stimulus mapping to image1-3 is referred as sub-task.
+	Every 100 trials, there is a new sub-task: three new random stimulus are assigned to image1-3. 
+	E.g. if in the current task image1 is a dragon, in task_{t+1} image1 is another random stimulus,, e.g. a flower.
+	In the description below, the * indicates any of the state (with uniform probability) or action.
+
+*Actions* 
+	1. left
+	2. right
+	3. wait
+
+*States*
+	state1
+		- Appearance
+			1. fixation cross
+		* Transition:
+			* T(stat1, left) -> state1, reward: 0
+			* T(stat1, right) -> state1, reward: 0
+			* T(stat1, wait) -> state2.*, reward: 0
+	state2	
+		- Appearance:
+			1. image1 vs image2
+			2. image2 vs image1
+			3.  image2 vs image3
+			4.  image3 vs image2
+			5.  image1 vs image3
+			6.  image3 vs image1
+		* Transition:
+			* T(state2.*, wait) -> state2.*, reward: 0
+	
+			* T(stat2.1, left) -> state3.1.*, reward: 0
+			- T(stat2.2, left) -> state3.2.*, reward: 0
+			* T(stat2.3, left) -> state3.2.*, reward: 0
+			* T(stat2.4, left) -> state3.3.*, reward: 0
+			* T(stat2.5, left) -> state3.1.*, reward: 0
+			* T(stat2.6, left) -> state3.3.*, reward: 0
+			
+			* T(stat2.1, right) -> state3.2.*, reward: 0
+			* T(stat2.2, right) -> state3.1.*, reward: 0
+			* T(stat2.3, right) -> state3.3.*, reward: 0
+			* T(stat2.4, right) -> state3.2.*, reward: 0
+			* T(stat2.5, right) -> state3.3.*, reward: 0
+			* T(stat2.6, right) -> state3.1.*, reward: 0
+	state3	
+		- Appearance: 
+			1. arrow light grey
+				1. pointing left
+				2. pointing right
+			2. arrow grey
+				1. pointing left
+				2. pointing right
+			3. arrow dark grey
+				1. pointing left
+				2. pointing right
+		- Transition:
+			* T(state3.*, wait) -> state.3.*
+
+			-	T(state.3.1.1, left) -> state.4.1, reward: 1
+			-	T(state.3.1.2, left) -> state.4.4, reward: 0
+			-	T(state.3.2.1, left) -> state.4.2, reward: 2
+			-	T(state.3.2.2, left) -> state.4.4, reward: 0
+			-	T(state.3.3.1, left) -> state.4.3, reward: 3
+			-	T(state.3.3.2, left) -> state.4.4, reward: 0
+	
+			-	T(state.3.1.1, right) -> state.4.4, reward: 0
+			-	T(state.3.1.2, right) -> state.4.1, reward: 1
+			-	T(state.3.2.1, right) -> state.4.4, reward: 0
+			-	T(state.3.2.2, right) -> state.4.2, reward: 2
+			-	T(state.3.3.1, right) -> state.4.4, reward: 0
+			-	T(state.3.3.2, right) -> state.4.3, reward: 3
+	state4
+		- Appearance:
+			1. V light grey
+			2. V grey
+			3. V dark grey
+			4. X
+		- Transition
+			* (state4.*, *) -> state1, reward 0
