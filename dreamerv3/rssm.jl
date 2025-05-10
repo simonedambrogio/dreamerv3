@@ -6,6 +6,7 @@ using OneHotArrays: onehot # Added for encoding
 using Zygote
 using SliceMap # Needed for preparing scan input
 using Zygote: Buffer, @ignore # Import Buffer
+using CUDA # Assuming CUDA.AbstractGPUArray is used for device check
 
 # Based on Python RSSM class attributes
 struct RSSM{AS, CN, PO, OI, T} <: Lux.AbstractLuxContainerLayer{(:core, :observation, :imagination)} # Added AS for type stability
@@ -48,7 +49,7 @@ function RSSM(; # Constructor
     @assert deter_dim % g == 0 "deter_dim must be divisible by blocks (g)"
     @assert (stoch_dim * classes_dim) % g == 0 "stoch_dim*classes_dim must be divisible by blocks (g)" # Might need this if stoch is used in BlockLinear
     @assert (3 * deter_dim) % g == 0 "3*deter_dim must be divisible by blocks (g)" # For gru_layer output
-    num_actions = act_space.high + 1 # Assuming discrete Space
+    num_actions = act_space.high# Assuming discrete Space
 
     # --- Define Core Layers --- 
 
@@ -191,7 +192,7 @@ end
 
 function (cell::ObserveCell)(x::ObserveInput, ps_rssm::NamedTuple, st_rssm::NamedTuple)
     batch_size = size(x.tokens, 2)
-    carry = initial_carry(cell.rssm, batch_size)
+    carry = initial_carry(cell.rssm, batch_size) |> _device;
     carry_next, entry_t, feat_t = _observe(cell.rssm, carry, x.tokens, x.action, x.reset, ps_rssm, st_rssm)
     return ((entry_t, feat_t), carry_next), st_rssm # Pass st_rssm through unchanged
 end
@@ -260,21 +261,14 @@ function observe(recurrent_observe::StatefulRecurrentCell, tokens, action, reset
     S, C = recurrent_observe.cell.rssm.stoch_dim, recurrent_observe.cell.rssm.classes_dim # Get stoch and classes dims
     D = recurrent_observe.cell.rssm.deter_dim # Get deter dim
 
-    # --- Pre-allocate Output Arrays (Buffer Approach) ---
-    # Determine element type from carry (assuming consistency)
-    el_type = eltype(tokens)
+    # --- Initialize for functional accumulation ---
+    # Accumulated sequences will be stored as tuples of tensors
+    acc_seq_deter = ()
+    acc_seq_stoch = ()
+    acc_seq_logit = () # Or whatever features you extract
 
-    # Allocate arrays to store the full sequences
-    # Shapes: (feature_dim, T, B) or (feature_dim1, feature_dim2, T, B)
-    # seq_deter_out = similar(tokens, el_type, rssm.deter_dim, T, B)
-    # Assuming entry.stoch and feat.logit have same shape structure as initial carry.stoch
-    # stoch_dims = size(carry.stoch)[1:end-1] # Get stoch dims excluding Batch
-    # seq_stoch_out = similar(tokens, el_type, stoch_dims..., T, B)
-    # seq_logit_out = similar(tokens, el_type, stoch_dims..., T, B)
-
-    seq_deter_out = Buffer(zeros(el_type, D, T, B))
-    seq_stoch_out = Buffer(zeros(el_type, S, C, T, B))
-    seq_logit_out = Buffer(zeros(el_type, S, C, T, B))
+    # The state for the Lux.AbstractRecurrentCell for the loop
+    st_loop = st
 
     # --- Loop over time steps ---
     for t in 1:T
@@ -282,23 +276,36 @@ function observe(recurrent_observe::StatefulRecurrentCell, tokens, action, reset
         tokens_t = view(tokens, :, t, :) # Shape: (token_dim, B)
         action_t = view(action, t, :)   # Shape: (B,)
         reset_t = view(reset, t, :)     # Shape: (B,)
+        current_step_input = ObserveInput(tokens_t, action_t, reset_t)
 
-        out, st = recurrent_observe(ObserveInput(tokens_t, action_t, reset_t), ps, st);
-        entry_t, feat_t = out
-
+        # Call the recurrent cell for one step.
+        # This uses ps and the current st_loop, and returns (output_for_step, new_recurrent_cell_state).
+        (entry_t, feat_t), st_loop = recurrent_observe(current_step_input, ps, st_loop)
         
-        # Store results in buffers
-        seq_deter_out[:, t, :] = entry_t.deter
-        seq_stoch_out[:, :, t, :] = entry_t.stoch # Store stoch state
-        seq_logit_out[:, :, t, :] = feat_t.logit
+        # Accumulate outputs by creating new tuples (Zygote-friendly)
+        # entry_t.deter, entry_t.stoch, feat_t.logit are expected to be on the GPU if inputs are.
+        acc_seq_deter = (acc_seq_deter..., entry_t.deter) 
+        acc_seq_stoch = (acc_seq_stoch..., entry_t.stoch) 
+        acc_seq_logit = (acc_seq_logit..., feat_t.logit) # Assuming feat_t has a .logit field
     end
 
-    # --- Prepare final outputs ---
-    # The pre-allocated arrays now hold the full sequences
-    final_feat = (; deter=copy(seq_deter_out), stoch=copy(seq_stoch_out), logit=copy(seq_logit_out))
-    final_entry = (; deter=copy(seq_deter_out), stoch=copy(seq_stoch_out))
+    # --- After loop, concatenate the tuples of CuArrays to form final sequence CuArrays ---
+    
+    # Determine dimensions for empty case from model config if possible
+    D_dim = hasproperty(recurrent_observe, :cell) && hasproperty(recurrent_observe.cell, :rssm) ? recurrent_observe.cell.rssm.deter_dim : (isempty(acc_seq_deter) ? 0 : size(acc_seq_deter[1],1))
+    stoch_size_S = hasproperty(recurrent_observe, :cell) && hasproperty(recurrent_observe.cell, :rssm) ? recurrent_observe.cell.rssm.stoch_dim : (isempty(acc_seq_stoch) ? 0 : size(acc_seq_stoch[1],1))
+    stoch_size_C = hasproperty(recurrent_observe, :cell) && hasproperty(recurrent_observe.cell, :rssm) ? recurrent_observe.cell.rssm.classes_dim : (isempty(acc_seq_stoch) ? 0 : size(acc_seq_stoch[1],2))
+    
+    seq_deter_final = cat([reshape(d, size(d,1), 1, size(d,2)) for d in acc_seq_deter]...; dims=2)
+    seq_stoch_final = cat([reshape(s, size(s,1), size(s,2), 1, size(s,3)) for s in acc_seq_stoch]...; dims=3)
+    seq_logit_final = cat([reshape(l, size(l,1), size(l,2), 1, size(l,3)) for l in acc_seq_logit]...; dims=3)
+    
+    # Prepare final outputs as per your desired structure
+    final_feat_combined = (; deter=seq_deter_final, stoch=seq_stoch_final, logit=seq_logit_final)
+    final_entry_combined = (; deter=seq_deter_final, stoch=seq_stoch_final) # Subset of features
 
-    return (final_entry, final_feat), st
+    # Return the combined sequences and the final state of the recurrent cell
+    return (final_entry_combined, final_feat_combined), st_loop 
 end
 
 function _observe(rssm::RSSM, carry::NamedTuple, tokens::AbstractArray, action::AbstractVector{T}, reset::AbstractVector{B}, ps, st) where {T<:Integer, B<:Bool}
@@ -323,7 +330,7 @@ function _observe(rssm::RSSM, carry::NamedTuple, tokens::AbstractArray, action::
     @assert !isnothing(rssm.act_space) "RSSM requires act_space to process actions"
     num_actions = rssm.act_space.high # Assumes Space defines range [low, high)
     # Perform one-hot encoding. Note: NNlib.onehotbatch expects indices starting from 1.
-    action_onehot = OneHotArrays.onehotbatch(action, 0:num_actions) # Shape: (num_actions, Batch)
+    action_onehot = OneHotArrays.onehotbatch(action, 1:num_actions) # Shape: (num_actions, Batch)
     action_onehot_casted = cast(action_onehot) # Cast to COMPUTE_TYPE
     # Apply reset mask to the processed action
     action = action_onehot_casted .* deter_mask # Broadcast (1, Batch) mask
@@ -507,6 +514,76 @@ Uses smoothed probabilities for sampling but unsmoothed probabilities for gradie
 Output shape: (stoch_dim, classes_dim, Batch...)
 """
 function sample_ste(rng::AbstractRNG, d::OneHotDist)
+    logits = d.logits # Shape (stoch_dim, classes_dim, Batch...)
+    unimix = d.unimix
+    stoch_dim, classes_dim = size(logits, 1), size(logits, 2)
+    batch_dims = size(logits)[3:end]
+    compute_T = eltype(logits)
+
+    # Determine the device function (e.g., gpu_device() or cpu_device())
+    # based on the type of the input logits.
+    dev_func = logits isa CUDA.AbstractGPUArray ? Lux.gpu_device() : Lux.cpu_device()
+
+    # --- Sampling based on smoothed probabilities ---
+    probs_raw = softmax(logits; dims=2) # Remains on original device (e.g., GPU)
+    probs_smoothed = (1 - unimix) .* probs_raw .+ unimix / classes_dim
+    probs_clipped = max.(probs_smoothed, zero(compute_T)) # Remains on original device
+
+    num_distributions = stoch_dim * prod(batch_dims; init=1)
+
+    # Reshape probs_clipped for easier iteration. It's still on the original device.
+    # Permuted shape: (stoch_dim, batch_dims..., classes_dim)
+    # Then reshaped to (num_distributions, classes_dim)
+    probs_2d_device = reshape(permutedims(probs_clipped, (1, (3:ndims(probs_clipped))..., 2)), num_distributions, classes_dim)
+
+    # --- Perform sampling on CPU to avoid scalar indexing on GPU ---
+    # 1. Move all probability distributions to CPU at once.
+    probs_2d_cpu = Array(probs_2d_device) # Transfer from GPU to CPU if on GPU
+
+    # 2. Perform sampling on CPU data using a comprehension (Zygote-friendly)
+    # This was the site of the previous Zygote error.
+    sampled_indices_cpu = [begin
+                               prob_view_cpu = view(probs_2d_cpu, i, :)
+                               prob_weights = Weights(prob_view_cpu, one(eltype(prob_view_cpu))) # Ensure sum is typed correctly
+                               StatsBase.sample(rng, 1:classes_dim, prob_weights)
+                           end for i in 1:num_distributions]
+    # sampled_indices_cpu is now a Vector{Int} created without in-place setindex!
+
+    # --- One-hot encode the sampled index (value for forward pass) ---
+    indices_final_shape = (stoch_dim, batch_dims...) # Target shape for indices
+    indices_reshaped_cpu = reshape(sampled_indices_cpu, indices_final_shape)
+
+    # 3. Move indices back to the original device (e.g., GPU) for subsequent operations.
+    indices_reshaped_device = dev_func(indices_reshaped_cpu)
+
+    # Use OneHotArrays.onehotbatch for non-mutating creation
+    # Input indices_reshaped_device shape: (stoch_dim, batch_dims...)
+    value_onehot_permuted = OneHotArrays.onehotbatch(indices_reshaped_device, 1:classes_dim)
+    # Output shape of onehotbatch: (classes_dim, stoch_dim, batch_dims...)
+
+    # Permute to desired shape: (stoch_dim, classes_dim, batch_dims...)
+    perm = (2, 1, (3:ndims(value_onehot_permuted))...)
+    value_onehot = permutedims(value_onehot_permuted, perm) # This will be on the original device
+
+    # --- Apply Straight-Through Estimator (STE) ---
+    # STE: sg(value) + (probs - sg(probs))
+    # Use Zygote.@ignore to stop gradients for the discrete parts.
+    # Use the *unsmoothed* probs_raw for the gradient path.
+    ste_value = Zygote.@ignore(value_onehot) .+ (probs_raw .- Zygote.@ignore(probs_raw))
+
+    return ste_value
+end
+
+
+
+"""
+    sample_ste(rng::AbstractRNG, d::OneHotDist)
+
+Sample from the OneHotDist and apply the Straight-Through Estimator (STE).
+Uses smoothed probabilities for sampling but unsmoothed probabilities for gradient flow.
+Output shape: (stoch_dim, classes_dim, Batch...)
+"""
+function sample_ste_old(rng::AbstractRNG, d::OneHotDist)
     logits = d.logits
     unimix = d.unimix
     stoch_dim, classes_dim = size(logits, 1), size(logits, 2)
@@ -551,9 +628,8 @@ function sample_ste(rng::AbstractRNG, d::OneHotDist)
     ste_value = Zygote.@ignore(value_onehot) .+ (probs_raw .- Zygote.@ignore(probs_raw))
 
     # --- Cast final result to compute type ---
-    return cast(ste_value)
+    return ste_value
 end
-
 
 """
     Base.rand(rng::AbstractRNG, d::OneHotDist)
@@ -611,7 +687,7 @@ function Base.rand(rng::AbstractRNG, d::OneHotDist)
     end
 
     # 4. Cast to compute type
-    return cast(stoch_onehot) # Assumes cast function handles Bool -> compute_T
+    return stoch_onehot # Assumes cast function handles Bool -> compute_T
 end
 
 

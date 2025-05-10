@@ -134,8 +134,8 @@ function (enc::Encoder)(obs, ps, st)
     # flatten the sequence and batch dimensions
     W, H, C, T, B = size(imgs);
     imgs = reshape(imgs, (W, H, C, T*B));
-    @assert typeof(imgs) == Array{UInt8, 4} "Image must be an array of UInt8"
-    imgs = cast.(imgs) ./ cast(255) .- cast(0.5);
+    @assert eltype(imgs) == UInt8 "Image must be an array of UInt8"
+    imgs = imgs ./ 255f0 .- 0.5f0;
     
     output, _ = enc.convolve(imgs, ps.convolve, st.convolve);
 
