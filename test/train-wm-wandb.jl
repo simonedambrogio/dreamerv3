@@ -3,7 +3,7 @@ include("../dreamerv3/WorldModel.jl");
 include("../embodied/envs/custom/generalization.jl");
 include("../embodied/core/replay.jl");
 using Optimisers, Random, Statistics, YAML, Zygote, GLMakie
-using Dates, JLD2
+using Wandb, Logging, Dates, JLD2
 
 println("--- World Model Training Test ---")
 
@@ -12,16 +12,22 @@ config_filepath = joinpath(@__DIR__, "..", "dreamerv3", "configs.yaml");
 fullconfig = YAML.load_file(config_filepath);
 config = make_config(fullconfig, "defaults");
 
+lg = WandbLogger(
+    project="dreamerv3", name="test-$(now())",
+    config=config);
+config["logdir"] = string(lg.wrun.dir);
+global_logger(lg)
+
 # --- Helper Functions ---
 function experience_replay(env, replay, batch_size, num_steps, spaces)
     println("\n--- Starting Warmup Phase ($num_steps steps) ---")
-    current_observation = env.current_observation # Use the passed initial observation
+    obs = env.fixation_cross # Use the passed initial observation
     for warmup_step in 1:num_steps
         action = rand(replay.rng, spaces[:action].low:spaces[:action].high) # Random action
         next_obs, reward, done = step!(env, action);
 
         step_data = Dict(
-            :image => current_observation,       # Use :image key
+            :image => obs,       # Use :image key
             :action => Int32(action),
             :reward => Float32(reward),
             :is_first => (warmup_step == 1), # Technically only true for the very first step overall
@@ -30,7 +36,7 @@ function experience_replay(env, replay, batch_size, num_steps, spaces)
         )
         add!(replay, step_data, 0) # Add to worker 0 stream
 
-        current_observation = next_obs # Update local obs
+        obs = next_obs # Update local obs
         # if done
         #     obs = reset!(env) # Reset env and update local obs
         # end
@@ -44,7 +50,7 @@ function experience_replay(env, replay, batch_size, num_steps, spaces)
         error("Replay buffer has only $(length(replay)) items after warmup, less than batch size $batch_size. Increase warmup steps.")
     end
     println("Warmup complete. Replay buffer size: $(length(replay)) items.")
-    return current_observation # Return the final observation state
+    return obs # Return the final observation state
 end;
 
 function run_training_loop(
@@ -231,38 +237,3 @@ println("--- Script finished training ---")
 # Close Wandb logger at the very end
 close(lg)
 println("--- Script fully finished ---")
-
-
-function experience_replay(env, replay, batch_size, num_steps, spaces)
-    println("\n--- Starting Warmup Phase ($num_steps steps) ---")
-    current_observation = env.current_observation # Use the passed initial observation
-    for warmup_step in 1:num_steps
-        action = rand(replay.rng, spaces[:action].low:spaces[:action].high) # Random action
-        _, reward, done = step!(env, action);
-
-        step_data = Dict(
-            :image => current_observation,       # Use :image key
-            :action => Int32(action),
-            :reward => Float32(reward),
-            :is_first => (warmup_step == 1), # Technically only true for the very first step overall
-            :is_last => done,
-            :is_terminal => done
-        )
-        add!(replay, step_data, 0) # Add to worker 0 stream
-
-        # current_observation = next_obs # Update local obs
-        
-        if warmup_step % 200 == 0 || warmup_step == num_steps
-            println("Warmup Step: $warmup_step / $num_steps, Replay items: $(length(replay))")
-        end
-    end
-
-    if length(replay) < batch_size
-        error("Replay buffer has only $(length(replay)) items after warmup, less than batch size $batch_size. Increase warmup steps.")
-    end
-    println("Warmup complete. Replay buffer size: $(length(replay)) items.")
-    return current_observation
-end
-
-final_obs_after_warmup = experience_replay(env, replay, config["run"]["batch_size"], config["agent"]["opt"]["warmup"], spaces);
-

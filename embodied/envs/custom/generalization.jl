@@ -5,6 +5,8 @@ using StatsBase: sample # For sampling option pairs
 using LuxCore: AbstractRNG # For type hinting RNG
 const config_path = "embodied/envs/custom/configs.yaml";
 
+getnode() = gethostname()=="epsymac58.psy.ox.ac.uk" ? "local" : "cluster";
+
 # Helper function to create a fixation cross
 function create_fixation_cross(W::Int, H::Int, cross_thickness::Int=2, cross_length::Int=10, bg_color::UInt8=0xff, cross_color::UInt8=0x00)
     img = fill(bg_color, W, H, 1) # Gray background
@@ -60,7 +62,7 @@ function load_options(
         config_path::String=config_path
     )
     cfg = YAML.load_file(config_path)
-    stimuli_path = cfg["paths"]["grays"] # Use grayscale images
+    stimuli_path = cfg["paths"][getnode()]["grays"] # Use grayscale images
 
     # Load Options (Good, Medium, Bad) - Expected size W x H/2
     options = Vector{Array{UInt8, 3}}(undef, 3)
@@ -84,7 +86,7 @@ end;
 
 function load_directions(W::Int, H::Int, verbose::Bool=false, config_path::String=config_path)
     cfg = YAML.load_file(config_path)
-    stimuli_path = cfg["paths"]["grays"] # Use grayscale images
+    stimuli_path = cfg["paths"][getnode()]["grays"] # Use grayscale images
 
     directions = Matrix{Array{UInt8, 3}}(undef, 3, 2)
     dir_names = ["left", "right"]
@@ -119,7 +121,7 @@ function GeneralizationEnv(;
 
     rng = Random.MersenneTwister(seed)
     cfg = YAML.load_file(config_path)
-    stimuli_path = cfg["paths"]["grays"] # Use grayscale images
+    stimuli_path = cfg["paths"][getnode()]["grays"] # Use grayscale images
     image_dims = (W, H)
 
     # --- Create Fixation Cross ---

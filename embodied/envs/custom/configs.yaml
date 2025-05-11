@@ -1,3 +1,7 @@
-"paths":
-  "grays": "/Volumes/PROJECTS/Ongoing/Exploration/dreamerv3-lux/embodied/envs/custom/stimuli/img/Grays"
-  "rgbs": "/Volumes/PROJECTS/Ongoing/Exploration/dreamerv3-lux/embodied/envs/custom/stimuli/img/RGB"
+paths:
+  local:
+    grays: "/Volumes/PROJECTS/Ongoing/Exploration/dreamerv3-lux/embodied/envs/custom/stimuli/img/Grays"
+    rgbs: "/Volumes/PROJECTS/Ongoing/Exploration/dreamerv3-lux/embodied/envs/custom/stimuli/img/RGB"
+  cluster:
+    grays: "/users/rushworth/gwr089/scratch/Explore/dreamerv3/embodied/envs/custom/stimuli/img/Grays"
+    rgbs: "/users/rushworth/gwr089/scratch/Explore/dreamerv3/embodied/envs/custom/stimuli/img/RGB"
