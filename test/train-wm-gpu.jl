@@ -1,11 +1,9 @@
 # test/train-wm.jl
-# import Pkg; Pkg.add("DataFrames")
 include("../dreamerv3/WorldModel.jl");
 include("../embodied/envs/custom/generalization.jl");
 include("../embodied/core/replay.jl");
 using Optimisers, Random, Statistics, YAML, Zygote
 using Dates, JLD2, LuxCUDA, CSV, DataFrames
-# using CairoMakie
 
 println("--- World Model Training Test ---")
 if CUDA.functional()
@@ -70,6 +68,15 @@ function run_training_loop(
     # Create logdir if it doesn't exist
     !isdir(logdir) && mkpath(logdir);
 
+    # Initialize a DataFrame to store all losses for this run
+    losses_df = DataFrame(
+        train_step=Int[], 
+        total_loss=Float32[], 
+        dyn_loss=Float32[], 
+        rep_loss=Float32[], 
+        recon_loss=Float32[]
+    );
+
     println("\n--- Starting Training Phase ($num_steps steps) ---")
     # Make ps and st mutable copies for updates within the function
     mutable_ps = deepcopy(initial_ps);
@@ -115,9 +122,8 @@ function run_training_loop(
             avg_recon_loss = recon_loss_acc / count
 
             # Save checkpoint every log_every steps
-            checkpoint_dir = joinpath(logdir, "checkpoints");
-            !isdir(checkpoint_dir) && mkdir(checkpoint_dir);
-            checkpoint_i_dir = joinpath(checkpoint_dir, "ckp$(train_step)");
+            # !isdir(logdir) && mkdir(logdir); # Already ensured logdir exists
+            checkpoint_i_dir = joinpath(logdir, "ckp$(train_step)");
             !isdir(checkpoint_i_dir) && mkdir(checkpoint_i_dir);
             # Move parameters and state to CPU before saving
             ps_cpu = mutable_ps |> cpu_device()
@@ -126,13 +132,20 @@ function run_training_loop(
             @save joinpath(checkpoint_i_dir, "ckpt.jld2") ps_cpu st_cpu
             println("Saving images")
             log_reconstruction(replay, agent, batch_size, mutable_ps, mutable_st, checkpoint_i_dir)
-            println("Saving losses")
-            CSV.write(joinpath(checkpoint_i_dir, "losses.csv"), DataFrame(
-                :total_loss => [avg_total_loss],
-                :dyn_loss => [avg_dyn_loss],
-                :rep_loss => [avg_rep_loss],
-                :recon_loss => [avg_recon_loss]
-            ))
+            
+            println("Saving losses to $(joinpath(logdir, "losses.csv"))")
+            # Create a new row for the current training step's losses
+            new_loss_row = (
+                train_step = train_step,
+                total_loss = avg_total_loss,
+                dyn_loss = avg_dyn_loss,
+                rep_loss = avg_rep_loss,
+                recon_loss = avg_recon_loss
+            );
+            # Append the new row to the in-memory DataFrame
+            push!(losses_df, new_loss_row);
+            # Write the entire DataFrame to the CSV file, overwriting the previous version
+            CSV.write(joinpath(logdir, "losses.csv"), losses_df);
             
             println("Train Step: $train_step, Avg Loss: $(round(avg_total_loss, digits=4)) [D:$(round(avg_dyn_loss, digits=4)), R:$(round(avg_rep_loss, digits=4)), Img:$(round(avg_recon_loss, digits=4))]")
             # Reset local accumulators
