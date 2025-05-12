@@ -78,7 +78,7 @@ function loss(agent::WorldModelAgent, obs, ps, st)
     recons, st_dec = agent.decoder(feat, ps.decoder, st.decoder);
 
     # --- Reconstruction Loss ---
-    target_image = cast.(obs[:image]) ./ cast(255); # Access Dict with Symbol
+    target_image = obs[:image] ./ cast(255); # Access Dict with Symbol
     # recon_loss should have shape (T, B)
     recon_loss = calculate_reconstruction_loss_sum(recons, target_image) # Use the sum version
 
