@@ -3,7 +3,12 @@ using Images
 using Random
 using StatsBase: sample # For sampling option pairs
 using LuxCore: AbstractRNG # For type hinting RNG
-const config_path = "/users/rushworth/gwr089/scratch/Explore/dreamerv3/embodied/envs/custom/configs.yaml";
+
+if gethostname()=="epsymac58.psy.ox.ac.uk"
+    const config_path = "/Volumes/PROJECTS/Ongoing/Exploration/dreamerv3-lux/embodied/envs/custom/configs.yaml";
+else
+    const config_path = "/users/rushworth/gwr089/scratch/Explore/dreamerv3/embodied/envs/custom/configs.yaml";
+end
 
 getnode() = gethostname()=="epsymac58.psy.ox.ac.uk" ? "local" : "cluster";
 

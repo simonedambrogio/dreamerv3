@@ -12,7 +12,7 @@ if CUDA.functional()
 else
     println("CUDA is not functional")
     _device = cpu_device()
-end
+end;
 
 # --- Configuration ---
 config_filepath = joinpath(@__DIR__, "..", "dreamerv3", "configs.yaml");
@@ -39,7 +39,7 @@ function experience_replay(env, replay, batch_size, num_steps, spaces)
         add!(replay, step_data, 0) # Add to worker 0 stream
 
         # At every timestep, the imahe is always the same
-        # current_observation = next_obs # Update local obs
+        current_observation = next_obs # Update local obs
 
         if warmup_step % 200 == 0 || warmup_step == num_steps
             println("Warmup Step: $warmup_step / $num_steps, Replay items: $(length(replay))")
@@ -160,7 +160,7 @@ function run_training_loop(
     return mutable_ps, mutable_st, opt_st # Return the final states
 end;
 
-function log_reconstruction(replay, agent, batch_size, mutable_ps, mutable_st, outdir, make_plot=false)
+function log_reconstruction(replay, agent, batch_size, mutable_ps, mutable_st, outdir)
 
     # 1. Sample a batch (B=1, T=sequence_length)
     recon_batch_gpu = sample(replay, batch_size) |> _device; # Sample a batch of size 1 and move to device
@@ -179,24 +179,10 @@ function log_reconstruction(replay, agent, batch_size, mutable_ps, mutable_st, o
     # t_idx = 1 # Select the first time step
     b_idx = 1 # Select the first (only) batch element
 
-    # Original image from CPU batch
-    original_image_uint8_cpu = recon_batch_cpu[:image][:, :, :, :, b_idx] # Shape (W, H, C)
     # Reconstructed image - move to CPU and then process
     reconstructed_image_gpu = recons[:, :, :, :, b_idx]
     reconstructed_image_cpu = reconstructed_image_gpu |> cpu_device()
     reconstructed_image_processed = reconstructed_image_cpu .* cast(255) # Shape (W, H, C)
-
-
-    # 6. Log to Wandb
-    if make_plot
-        f = Figure(); 
-        ax = CairoMakie.Axis(f[1, 1], aspect=DataAspect()); 
-        heatmap!(ax, rotr90(original_image_uint8_cpu[:,:,1]), colormap=:grays, colorrange = (0, 255)); 
-        ax = CairoMakie.Axis(f[1, 2], aspect=DataAspect()); 
-        heatmap!(ax, rotr90(reconstructed_image_processed[:,:,1]), colormap=:grays, colorrange = (0, 255)); 
-        
-        save(joinpath(outdir, "reconstruction.png"), f)
-    end
 
     # Save input to encoder (use CPU version of the batch for saving)
     jldsave(joinpath(outdir, "encoder_input.jld2"); image=recon_batch_cpu[:image])
